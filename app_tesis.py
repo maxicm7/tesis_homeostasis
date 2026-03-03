@@ -551,7 +551,7 @@ def main():
     
     st.sidebar.subheader("2. Período de Análisis")
     col1, col2 = st.sidebar.columns(2)
-    with col1: start_date = st.date_input("Inicio", value=datetime(2020, 1, 1))
+    with col1: start_date = st.date_input("Inicio", value=datetime(2008, 1, 1))
     with col2: end_date = st.date_input("Fin", value=datetime.now())
     
     st.sidebar.subheader("3. Parámetros del Modelo")
