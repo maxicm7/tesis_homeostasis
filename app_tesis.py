@@ -155,30 +155,45 @@ def calculate_returns(prices):
     return returns
 
 # ============================================================================
-# 📈 MODELO GARCH UNIVARIADO (SIMPLIFICADO)
+# 📈 MODELO GARCH UNIVARIADO (CORREGIDO PARA MÚLTIPLES COLUMNAS)
 # ============================================================================
 
 def garch_filter(returns, p=1, q=1):
     """
     Filtrado GARCH(1,1) simplificado para residuos estandarizados
-    Nota: Para producción usar librería 'arch'
+    Maneja correctamente DataFrames con múltiples columnas
     """
     n = len(returns)
-    sigma2 = np.zeros(n)
-    sigma2[0] = returns.var()
+    n_cols = returns.shape[1]
+    
+    # Inicializar DataFrames para mantener estructura y nombres de columnas
+    sigma2 = pd.DataFrame(np.zeros((n, n_cols)), index=returns.index, columns=returns.columns)
+    sigma = pd.DataFrame(np.zeros((n, n_cols)), index=returns.index, columns=returns.columns)
+    z_std = pd.DataFrame(np.zeros((n, n_cols)), index=returns.index, columns=returns.columns)
     
     # Parámetros GARCH típicos (estimados)
     omega = 0.00001
     alpha = 0.1
     beta = 0.85
     
-    for t in range(1, n):
-        sigma2[t] = omega + alpha * returns.iloc[t-1]**2 + beta * sigma2[t-1]
-    
-    sigma = np.sqrt(sigma2)
-    # Evitar división por cero
-    sigma[sigma < 1e-10] = 1e-10
-    z_std = returns / sigma
+    # Procesar cada columna (activo) por separado
+    for col in returns.columns:
+        # Inicializar varianza con la varianza muestral de esa columna
+        sigma2[col].iloc[0] = returns[col].var()
+        
+        # Iterar GARCH
+        for t in range(1, n):
+            sigma2[col].iloc[t] = omega + alpha * returns[col].iloc[t-1]**2 + beta * sigma2[col].iloc[t-1]
+        
+        # Calcular desviación estándar
+        sigma[col] = np.sqrt(sigma2[col])
+        
+        # Evitar división por cero
+        sigma[col] = sigma[col].replace(0, 1e-10)
+        sigma[col] = sigma[col].clip(lower=1e-10)
+        
+        # Calcular residuos estandarizados
+        z_std[col] = returns[col] / sigma[col]
     
     return z_std, sigma
 
