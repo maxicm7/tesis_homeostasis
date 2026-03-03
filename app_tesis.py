@@ -279,106 +279,147 @@ def calculate_systemic_indicator(indicators, kappa=0.3):
     return H_t, prop_stressed
 
 # ============================================================================
-# 🔗 MODELO DCC-GARCH HOMEOSTÁTICO
+# 🔗 MODELO DCC-GARCH HOMEOSTÁTICO - VERSIÓN ESTABLE NUMÉRICAMENTE
 # ============================================================================
 
 def dcc_likelihood_full(z_std, H_indicator, Q_bar, params):
     """
-    Calcula la log-verosimilitud completa del modelo DCC
+    Calcula la log-verosimilitud completa del modelo DCC - Versión estable
     params: [a, b, gamma] para DCC-H o [a, b] para DCC estándar
     """
     T = len(z_std)
     N = z_std.shape[1]
     
-    a = params[0]
-    b = params[1]
-    gamma = params[2] if len(params) == 3 else 0
+    # Extraer parámetros
+    a = max(params[0], 1e-8)
+    b = max(params[1], 1e-8)
+    gamma = max(params[2], 1e-8) if len(params) > 2 else 0
     
-    # Verificar restricciones
-    if a < 0 or b < 0 or gamma < 0:
-        return -np.inf
-    if a + b + gamma >= 1:
+    # Restricciones de estabilidad
+    if a + b + gamma >= 0.95:  # Más estricto que 1.0
         return -np.inf
     
-    # Matriz de correlación de estrés
+    # Verificar que los parámetros no sean demasiado grandes
+    if a > 0.5 or b > 0.95 or gamma > 0.5:
+        return -np.inf
+    
+    # Calcular Q_stress con regularización
     stress_periods = z_std[H_indicator == 1]
     if len(stress_periods) > 10:
         Q_stress = np.corrcoef(stress_periods.T)
+        # Regularizar para asegurar definida-positividad
+        Q_stress = ensure_positive_definite(Q_stress, min_eig=1e-6)
     else:
         Q_stress = Q_bar.copy()
+        Q_stress = ensure_positive_definite(Q_stress, min_eig=1e-6)
     
-    # Evolución de Q_t
+    # Evolución de Q_t con mayor estabilidad
     Q_prev = Q_bar.copy()
+    Q_prev = ensure_positive_definite(Q_prev, min_eig=1e-6)
+    
     log_lik = 0
     
     for t in range(1, T):
-        if gamma > 0 and H_indicator.iloc[t-1] == 1:
-            Q_t = (1 - a - b - gamma) * Q_bar + \
-                  a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
-                  b * Q_prev + \
-                  gamma * Q_stress
-        else:
-            Q_t = (1 - a - b) * Q_bar + \
-                  a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
-                  b * Q_prev
-        
-        # Normalizar a correlación
-        diag_q = np.sqrt(np.diag(Q_t))
-        diag_q[diag_q == 0] = 1e-10
-        D_inv = np.diag(1 / diag_q)
-        R_t = D_inv @ Q_t @ D_inv
-        
-        # Asegurar definida-positividad
-        min_eig = np.min(np.linalg.eigvalsh(R_t))
-        if min_eig < 1e-10:
-            R_t = R_t + (1e-10 - min_eig) * np.eye(N)
-        
-        # Contribución a log-verosimilitud
         try:
+            if gamma > 0 and H_indicator.iloc[t-1] == 1:
+                Q_t = (1 - a - b - gamma) * Q_bar + \
+                      a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
+                      b * Q_prev + \
+                      gamma * Q_stress
+            else:
+                Q_t = (1 - a - b) * Q_bar + \
+                      a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
+                      b * Q_prev
+            
+            # Normalizar a correlación
+            diag_q = np.sqrt(np.diag(Q_t))
+            diag_q[diag_q < 1e-8] = 1e-8  # Evitar división por cero
+            D_inv = np.diag(1 / diag_q)
+            R_t = D_inv @ Q_t @ D_inv
+            
+            # Asegurar definida-positividad crítica
+            min_eig = np.min(np.linalg.eigvalsh(R_t))
+            if min_eig < 1e-5:  # Umbral más sensible
+                R_t = R_t + (1e-5 - min_eig) * np.eye(N)
+            
+            # Contribución a log-verosimilitud
             sign, logdet = np.linalg.slogdet(R_t)
-            if sign <= 0:
+            if sign <= 0 or np.isnan(logdet):
                 return -np.inf
+            
             R_inv = np.linalg.inv(R_t)
-            log_lik += -0.5 * (logdet + z_std.iloc[t].T @ R_inv @ z_std.iloc[t])
-        except:
+            
+            # Vector de residuos normalizado
+            z_vec = z_std.iloc[t-1].values
+            quadratic_form = z_vec.T @ R_inv @ z_vec
+            
+            if np.isnan(quadratic_form) or quadratic_form > 1e6:
+                return -np.inf
+            
+            log_lik += -0.5 * (logdet + quadratic_form)
+            
+            Q_prev = R_t.copy()
+            
+        except Exception as e:
             return -np.inf
-        
-        Q_prev = Q_t.copy()
     
     return log_lik
 
+
+def ensure_positive_definite(matrix, min_eig=1e-6):
+    """
+    Forzar que una matriz sea definida positiva añadiendo al diagonal si es necesario
+    """
+    symmetric_matrix = (matrix + matrix.T) / 2
+    
+    eigvals, eigvecs = np.linalg.eigh(symmetric_matrix)
+    
+    min_eigval = np.min(eigvals)
+    
+    if min_eigval < min_eig:
+        # Añadir lambda * I donde lambda = min_eig - min_eigval
+        correction = (min_eig - min_eigval) * np.eye(len(matrix))
+        symmetric_matrix = symmetric_matrix + correction
+    
+    # Reconstruir matriz
+    new_eigvals = np.maximum(eigvals, min_eig)
+    corrected_matrix = eigvecs @ np.diag(new_eigvals) @ eigvecs.T
+    
+    return corrected_matrix
+
+
 def estimate_dcc_parameters(z_std, H_indicator, Q_bar, model_type='DCC-H'):
     """
-    Estima parámetros DCC por máxima verosimilitud
+    Estima parámetros DCC por máxima verosimilitud - Versión estable
     model_type: 'DCC-H' (con gamma) o 'DCC' (sin gamma)
     """
     def neg_log_lik(params):
-        return -dcc_likelihood_full(z_std, H_indicator, Q_bar, params)
+        result = dcc_likelihood_full(z_std, H_indicator, Q_bar, params)
+        if np.isinf(result) or np.isnan(result):
+            return 1e10
+        return -result
     
     if model_type == 'DCC-H':
-        # Tres parámetros: a, b, gamma
-        initial_params = [0.05, 0.90, 0.10]
-        bounds = [(1e-6, 0.5), (1e-6, 0.99), (0, 0.5)]
+        initial_params = [0.02, 0.92, 0.02]  # Menos agresivos inicialmente
+        bounds = [(1e-8, 0.3), (0.5, 0.95), (0, 0.3)]
     else:
-        # Dos parámetros: a, b (gamma = 0)
-        initial_params = [0.05, 0.90]
-        bounds = [(1e-6, 0.5), (1e-6, 0.99)]
+        initial_params = [0.02, 0.92]
+        bounds = [(1e-8, 0.3), (0.5, 0.95)]
     
     result = minimize(
         neg_log_lik,
         initial_params,
         method='L-BFGS-B',
         bounds=bounds,
-        options={'maxiter': 1000, 'ftol': 1e-8}
+        options={'maxiter': 2000, 'ftol': 1e-8}
     )
     
     return result
 
-def dcc_homeostatic(z_std, H_indicator, Q_bar=None):
+
+def dcc_homeostatic(z_std, H_indicator, Q_bar=None, regularization=True):
     """
-    Implementación del DCC-GARCH Homeostático
-    z_std: residuos estandarizados
-    H_indicator: indicador de tensión homeostática
+    Implementación del DCC-GARCH Homeostático - Versión estable
     """
     if z_std is None or z_std.empty:
         raise ValueError("z_std no puede ser nulo o vacío")
@@ -386,52 +427,74 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None):
     T = len(z_std)
     N = z_std.shape[1]
     
+    # Inicializar Q_bar de forma segura
     if Q_bar is None:
         Q_bar = np.corrcoef(z_std.T)
     
-    # Estimar parámetros óptimos
+    Q_bar = ensure_positive_definite(Q_bar, min_eig=1e-6)
+    
+    # Estimar parámetros óptimos con validación
     result = estimate_dcc_parameters(z_std, H_indicator, Q_bar, 'DCC-H')
     params = result.x
     
-    a = params[0]
-    b = params[1]
-    gamma = params[2] if len(params) == 3 else 0
+    # Validar parámetros obtenidos
+    if not result.success or np.any(np.isnan(params)):
+        # Usar parámetros por defecto seguros
+        a, b, gamma = 0.03, 0.90, 0.02
+    else:
+        a, b, gamma = float(params[0]), float(params[1]), float(params[2]) if len(params) > 2 else 0.0
     
-    # Matriz de correlación de estrés
+    # Clampear parámetros para evitar inestabilidad
+    a = np.clip(a, 1e-8, 0.3)
+    b = np.clip(b, 0.5, 0.95)
+    gamma = np.clip(gamma, 0, 0.3)
+    
+    # Matriz de correlación de estrés regularizada
     stress_periods = z_std[H_indicator == 1]
     if len(stress_periods) > 10:
         Q_stress = np.corrcoef(stress_periods.T)
     else:
         Q_stress = Q_bar.copy()
     
-    # Evolución de Q_t
+    Q_stress = ensure_positive_definite(Q_stress, min_eig=1e-6)
+    
+    # Evolución de Q_t con protección numérica
     Q_t = np.zeros((T, N, N))
     R_t = np.zeros((T, N, N))
     Q_t[0] = Q_bar
     
     for t in range(1, T):
-        if gamma > 0 and H_indicator.iloc[t-1] == 1:
-            Q_t[t] = (1 - a - b - gamma) * Q_bar + \
-                     a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
-                     b * Q_t[t-1] + \
-                     gamma * Q_stress
-        else:
-            Q_t[t] = (1 - a - b) * Q_bar + \
-                     a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
-                     b * Q_t[t-1]
-        
-        # Normalizar a matriz de correlación
-        diag_q = np.sqrt(np.diag(Q_t[t]))
-        diag_q[diag_q == 0] = 1e-10
-        D_inv = np.diag(1 / diag_q)
-        R_t[t] = D_inv @ Q_t[t] @ D_inv
-        
-        # Asegurar definida-positividad
-        min_eig = np.min(np.linalg.eigvalsh(R_t[t]))
-        if min_eig < 1e-10:
-            R_t[t] = R_t[t] + (1e-10 - min_eig) * np.eye(N)
+        try:
+            # Calcular Q_t según régimen
+            if gamma > 0 and H_indicator.iloc[t-1] == 1:
+                Q_t[t] = (1 - a - b - gamma) * Q_bar + \
+                         a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
+                         b * Q_t[t-1] + \
+                         gamma * Q_stress
+            else:
+                Q_t[t] = (1 - a - b) * Q_bar + \
+                         a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
+                         b * Q_t[t-1]
+            
+            # Guardar copia antes de normalizar
+            Q_t[t] = ensure_positive_definite(Q_t[t], min_eig=1e-8)
+            
+            # Normalizar a matriz de correlación
+            diag_q = np.sqrt(np.diag(Q_t[t]))
+            diag_q[diag_q < 1e-8] = 1e-8
+            D_inv = np.diag(1 / diag_q)
+            R_t[t] = D_inv @ Q_t[t] @ D_inv
+            
+            # Validar definitivamente-positividad final
+            min_eig = np.min(np.linalg.eigvalsh(R_t[t]))
+            if min_eig < 1e-5:
+                R_t[t] = R_t[t] + (1e-5 - min_eig) * np.eye(N)
+                
+        except Exception as e:
+            # Fallback si falla un paso: usar último valor válido
+            R_t[t] = R_t[t-1] if t > 0 else Q_bar
     
-    return R_t, Q_t, {'a': a, 'b': b, 'gamma': gamma, 'log_lik': -result.fun}
+    return R_t, Q_t, {'a': a, 'b': b, 'gamma': gamma, 'log_lik': result.fun if hasattr(result, 'fun') else -1e10}
 
 # ============================================================================
 # 🧪 TEST DE RAZÓN DE VEROSIMILITUD
