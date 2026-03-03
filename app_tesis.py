@@ -48,33 +48,105 @@ st.markdown("""
 
 @st.cache_data
 def download_data(tickers, start_date, end_date):
-    """Descarga datos desde Yahoo Finance"""
+    """Descarga datos desde Yahoo Finance - VERSIÓN CORREGIDA 2024"""
     try:
+        # Descargar datos
         data = yf.download(tickers, start=start_date, end=end_date, 
                           progress=False, auto_adjust=True)
         
-        # Manejar estructura de columnas de yfinance
+        # Verificar si los datos están vacíos
+        if data is None or (hasattr(data, 'empty') and data.empty):
+            st.error("No se recibieron datos de Yahoo Finance")
+            return None
+        
+        # Manejar diferentes estructuras de columnas de yfinance
         if len(tickers) == 1:
-            data = pd.DataFrame(data)
+            # Un solo ticker
+            if isinstance(data.columns, pd.MultiIndex):
+                # Nueva estructura de yfinance (2023+)
+                if ('Adj Close', tickers[0]) in data.columns:
+                    prices = data[('Adj Close', tickers[0])]
+                elif ('Close', tickers[0]) in data.columns:
+                    prices = data[('Close', tickers[0])]
+                else:
+                    # Intentar obtener cualquier columna de precio
+                    price_cols = [col for col in data.columns if 'Close' in str(col)]
+                    if price_cols:
+                        prices = data[price_cols[0]]
+                    else:
+                        prices = data.iloc[:, 0]
+            else:
+                # Estructura antigua
+                if 'Adj Close' in data.columns:
+                    prices = data['Adj Close']
+                elif 'Close' in data.columns:
+                    prices = data['Close']
+                else:
+                    prices = data.iloc[:, 0]
+            
+            prices = pd.DataFrame(prices, columns=[tickers[0]])
         
-        # Extraer precios de cierre ajustados
-        if isinstance(data.columns, pd.MultiIndex):
-            prices = data['Adj Close']
         else:
-            prices = data
+            # Múltiples tickers
+            if isinstance(data.columns, pd.MultiIndex):
+                # Nueva estructura de yfinance (2023+)
+                # Las columnas son MultiIndex: (Precio, Ticker)
+                prices_dict = {}
+                for ticker in tickers:
+                    if ('Adj Close', ticker) in data.columns:
+                        prices_dict[ticker] = data[('Adj Close', ticker)]
+                    elif ('Close', ticker) in data.columns:
+                        prices_dict[ticker] = data[('Close', ticker)]
+                
+                if prices_dict:
+                    prices = pd.DataFrame(prices_dict)
+                else:
+                    # Fallback: intentar extraer cualquier columna Close
+                    try:
+                        prices = data.xs('Close', level=0, axis=1)
+                    except:
+                        prices = data.iloc[:, :len(tickers)]
+            else:
+                # Estructura antigua
+                if 'Adj Close' in data.columns:
+                    prices = data['Adj Close']
+                elif 'Close' in data.columns:
+                    prices = data['Close']
+                else:
+                    st.warning("Columna 'Adj Close' no encontrada, usando primera columna")
+                    prices = data.iloc[:, :len(tickers)]
         
-        # Eliminar filas con muchos NaN
-        prices = prices.dropna(how='all')
+        # Limpieza de datos
+        prices = prices.dropna(how='all')  # Eliminar filas completamente vacías
+        prices = prices.ffill()  # Forward fill para días festivos
+        prices = prices.bfill()  # Backward fill para NaN restantes
         
-        # Forward fill para días festivos diferentes entre mercados
-        prices = prices.ffill()
+        # Verificar que tenemos datos válidos
+        if prices.empty or prices.shape[1] == 0:
+            st.error("No se pudieron extraer precios válidos")
+            return None
         
-        # Backward fill para cualquier NaN restante
-        prices = prices.bfill()
+        # Mostrar debug info si hay problemas
+        if prices.isnull().sum().sum() > 0:
+            st.warning(f"⚠️ Hay {prices.isnull().sum().sum()} valores NaN en los datos")
         
         return prices
+    
     except Exception as e:
-        st.error(f"Error descargando datos: {str(e)}")
+        st.error(f"❌ Error descargando datos: {str(e)}")
+        st.info("💡 **Soluciones posibles:**")
+        st.info("1. Verifica que los tickers sean válidos (ej: ^GSPC, TLT, GLD)")
+        st.info("2. Yahoo Finance puede tener límites de rate-limiting")
+        st.info("3. Intenta con un período de tiempo más corto")
+        st.info("4. Algunos tickers pueden haber sido eliminados de Yahoo Finance")
+        
+        # Mostrar información de debug
+        with st.expander("🔍 Ver información de debug"):
+            st.write(f"**Error técnico:** {type(e).__name__}")
+            st.write(f"**Detalle:** {str(e)}")
+            st.write(f"**Tickers solicitados:** {tickers}")
+            st.write(f"**Período:** {start_date} a {end_date}")
+        
         return None
 
 def calculate_returns(prices):
@@ -140,7 +212,10 @@ def fit_gumbel_threshold(residuals, confidence=0.95, window=252):
             avg_loc = np.mean(locs)
             avg_scale = np.mean(scales)
         else:
-            avg_loc, avg_scale = gumbel_r.fit(np.abs(residuals[col]))
+            try:
+                avg_loc, avg_scale = gumbel_r.fit(np.abs(residuals[col]))
+            except:
+                avg_loc, avg_scale = 0, 1
         
         # Umbral crítico (valor extremo)
         threshold = gumbel_r.ppf(confidence, loc=avg_loc, scale=avg_scale)
@@ -605,25 +680,11 @@ def plot_var_backtesting(returns, var_series, dates):
 
 def plot_out_of_sample_comparison(results):
     """Comparación de performance In-Sample vs Out-of-Sample"""
-    fig = make_subplots(rows=2, cols=1, shared_xaxes=False,
-                       vertical_spacing=0.15,
-                       subplot_titles=('In-Sample (Entrenamiento)', 'Out-of-Sample (Prueba)'))
-    
-    # In-Sample VaR
-    returns_train = pd.DataFrame()  # Simplificado para el ejemplo
-    var_train = np.zeros(100)  # Placeholder
-    
-    fig.add_trace(go.Scatter(
-        y=[0]*100,  # Placeholder
-        mode='lines',
-        name='VaR In-Sample',
-        line=dict(color='#1f77b4')
-    ), row=1, col=1)
-    
-    # Out-of-Sample VaR
     portfolio_return_oos = results['returns_test'].mean(axis=1)
     var_oos = results['var_test']
     dates_oos = results['returns_test'].index
+    
+    fig = go.Figure()
     
     fig.add_trace(go.Scatter(
         x=dates_oos,
@@ -631,7 +692,7 @@ def plot_out_of_sample_comparison(results):
         mode='lines',
         name='Retorno OoS',
         line=dict(color='#1f77b4', width=1)
-    ), row=2, col=1)
+    ))
     
     fig.add_trace(go.Scatter(
         x=dates_oos,
@@ -639,11 +700,26 @@ def plot_out_of_sample_comparison(results):
         mode='lines',
         name='VaR OoS (95%)',
         line=dict(color='#d62728', width=2, dash='dash')
-    ), row=2, col=1)
+    ))
+    
+    # Marcar violaciones OoS
+    violations = portfolio_return_oos < -var_oos
+    violation_dates = dates_oos[violations]
+    violation_values = portfolio_return_oos[violations]
+    
+    fig.add_trace(go.Scatter(
+        x=violation_dates,
+        y=violation_values,
+        mode='markers',
+        name='Violaciones VaR OoS',
+        marker=dict(color='red', size=8, symbol='x')
+    ))
     
     fig.update_layout(
-        title="📊 Validación Out-of-Sample: Comparación de Performance",
-        height=600,
+        title="📊 Validación Out-of-Sample: VaR vs Retornos Reales",
+        xaxis_title="Fecha",
+        yaxis_title="Retorno",
+        height=400,
         showlegend=True
     )
     
@@ -666,7 +742,7 @@ def main():
     # Selección de tickers
     st.sidebar.subheader("1. Selección de Activos")
     
-    # Portafolios predefinidos CORREGIDOS
+    # Portafolios predefinidos
     portfolio_choice = st.sidebar.selectbox(
         "Portafolio Predefinido",
         ["Mínimo (6 activos)", "Completo (12 activos)", "Personalizado"]
