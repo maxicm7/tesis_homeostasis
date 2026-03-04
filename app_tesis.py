@@ -2,7 +2,7 @@
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
 # Archivo: app_tesis.py
-# Versión: FINAL CORREGIDA Y RIGUROSA
+# Versión: FINAL CORREGIDA Y RIGUROSA (Protección contra NaNs y Activos Faltantes)
 # Ejecutar: streamlit run app_tesis.py
 # ============================================================================
 
@@ -49,28 +49,23 @@ st.markdown("""
 
 @st.cache_data(ttl=7200)
 def download_data(tickers, start_date, end_date):
-    """Descarga datos desde Yahoo Finance y asegura formato DataFrame"""
+    """Descarga datos desde Yahoo Finance y asegura formato DataFrame sin vacíos"""
     try:
-        data = yf.download(tickers, start=start_date, end=end_date, progress=False, auto_adjust=True)
+        data = yf.download(tickers, start=start_date, end=end_date, progress=False)
         
-        if data is None or (hasattr(data, 'empty') and data.empty):
+        if data is None or data.empty:
             return None
         
         # Manejar estructura MultiIndex (múltiples activos)
         if isinstance(data.columns, pd.MultiIndex):
-            prices_dict = {}
-            for ticker in tickers:
-                if ('Adj Close', ticker) in data.columns:
-                    prices_dict[ticker] = data[('Adj Close', ticker)]
-                elif ('Close', ticker) in data.columns:
-                    prices_dict[ticker] = data[('Close', ticker)]
-            
-            if prices_dict:
-                prices = pd.DataFrame(prices_dict)
+            if 'Adj Close' in data.columns.levels[0]:
+                prices = data['Adj Close']
+            elif 'Close' in data.columns.levels[0]:
+                prices = data['Close']
             else:
                 prices = data.iloc[:, :len(tickers)]
         else:
-            # Manejo si se descarga 1 solo ticker u otro formato anómalo
+            # Manejo si se descarga 1 solo activo o YF cambia formato
             if 'Adj Close' in data.columns:
                 prices = data[['Adj Close']].copy()
             elif 'Close' in data.columns:
@@ -78,32 +73,44 @@ def download_data(tickers, start_date, end_date):
             else:
                 prices = data.copy()
             
-            if len(tickers) == 1 and len(prices.columns) == 1:
+            if len(prices.columns) == 1 and len(tickers) == 1:
                 prices.columns = tickers
+            elif len(prices.columns) == 1:
+                prices.columns = [tickers[0]]
         
         if isinstance(prices, pd.Series):
             prices = prices.to_frame(name=tickers[0])
             
-        # Limpieza de datos
-        prices = prices.dropna(how='all').ffill().bfill()
+        # 1. Eliminar activos que no existían en absoluto (columnas 100% NaN)
+        prices = prices.dropna(axis=1, how='all')
         
         if prices.empty or prices.shape[1] == 0:
             return None
+            
+        # 2. Rellenar huecos internos (festivos) hacia adelante
+        prices = prices.ffill()
         
+        # 3. Eliminar fechas iniciales donde algunos activos aún no existían
+        prices = prices.dropna(how='any')
+        
+        if prices.empty or prices.shape[0] < 10:
+            return None
+            
         return prices
     except Exception as e:
         st.error(f"❌ Error descargando datos: {str(e)}")
         return None
 
 def calculate_returns(prices):
-    """Calcula retornos logarítmicos garantizando un DataFrame"""
+    """Calcula retornos logarítmicos garantizando un DataFrame limpio"""
     if isinstance(prices, pd.Series):
         prices = prices.to_frame()
     
-    returns = np.log(prices / prices.shift(1)).dropna()
+    returns = np.log(prices / prices.shift(1)).dropna(how='any')
     
-    if returns.empty:
-        raise ValueError("Retornos vacíos después de calcular")
+    # Manejar infinitos generados por precios anómalos (cero o negativos)
+    returns = returns.replace([np.inf, -np.inf], np.nan).dropna(how='any')
+    
     return returns
 
 # ============================================================================
@@ -866,15 +873,23 @@ def main():
             prices = download_data(tickers, start_date, end_date)
             
             if prices is None or prices.empty:
-                st.error("No se pudieron descargar los datos. Verifica los tickers.")
+                st.error("❌ No se encontraron datos válidos. Es posible que los activos no existieran en las fechas seleccionadas (Ej. Bitcoin en 2008).")
                 st.stop()
             
             returns = calculate_returns(prices)
-            valid_tickers = returns.columns.tolist() # Se alinea con los tickers exitosamente descargados
+            valid_tickers = returns.columns.tolist()
             
             if len(valid_tickers) < 2:
-                st.error("❌ El modelo DCC-GARCH requiere al menos 2 activos en el análisis. Añade más activos o revisa la validez de los tickers.")
+                st.error("❌ El modelo DCC-GARCH requiere al menos 2 activos concurrentes. Los datos disponibles en las fechas dadas no son suficientes.")
                 st.stop()
+                
+            if len(returns) < 50:
+                st.error(f"❌ Solo se obtuvieron {len(returns)} días de datos conjuntos. Se requieren al menos 50 observaciones para la convergencia del modelo.")
+                st.stop()
+                
+            dropped_tickers = set(tickers) - set(valid_tickers)
+            if dropped_tickers:
+                st.warning(f"⚠️ Los siguientes activos fueron excluidos automáticamente porque carecen de historial de precios en el período analizado: {', '.join(dropped_tickers)}")
                 
             col1, col2, col3 = st.columns(3)
             with col1:
