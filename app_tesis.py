@@ -108,30 +108,29 @@ def garch_filter(returns):
     n = len(returns)
     N = len(returns.columns)
     
-    # Calcular varianza promedio
-    total_var = float(returns.var().mean())
-    if total_var < 1e-10:
-        total_var = 1e-6
+    # Calcular varianza promedio inicial por columna
+    var_init = returns.var().values
+    var_init[var_init < 1e-10] = 1e-6
     
     sigma2 = np.zeros((n, N))
-    sigma2[:, :] = total_var
-    z_std_list = []
+    z_std = pd.DataFrame(index=returns.index, columns=returns.columns, dtype=float)
     
     omega, alpha, beta = 0.00001, 0.1, 0.85
     
     for i in range(N):
-        sigma_col = np.full(n, total_var)
+        sigma_col = np.zeros(n)
+        sigma_col[0] = var_init[i]
         
+        vals = returns.iloc[:, i].values
         for t in range(1, n):
-            val = returns.iloc[t-1].iloc[i]
-            sigma_col[t] = omega + alpha * val**2 + beta * sigma_col[t-1]
+            sigma_col[t] = omega + alpha * (vals[t-1]**2) + beta * sigma_col[t-1]
         
-        sigma = np.sqrt(sigma_col)
-        sigma[sigma < 1e-10] = 1e-10
-        z_col = returns.iloc[:, i] / sigma
-        z_std_list.append(z_col.values)
+        sigma2[:, i] = sigma_col
+        sigma_sqrt = np.sqrt(sigma_col)
+        sigma_sqrt[sigma_sqrt < 1e-10] = 1e-10
+        
+        z_std.iloc[:, i] = vals / sigma_sqrt
     
-    z_std = pd.DataFrame(np.column_stack(z_std_list), index=returns.index, columns=returns.columns)
     sigma_mean = np.sqrt(sigma2.mean(axis=1))
     sigma_mean[sigma_mean < 1e-10] = 1e-10
     
@@ -197,10 +196,6 @@ def ensure_positive_definite(matrix, min_eig=1e-6):
     """Forzar que una matriz sea definida positiva"""
     symmetric_matrix = (matrix + matrix.T) / 2
     eigvals, eigvecs = np.linalg.eigh(symmetric_matrix)
-    
-    if np.min(eigvals) < min_eig:
-        symmetric_matrix = symmetric_matrix + (min_eig - np.min(eigvals)) * np.eye(len(matrix))
-    
     new_eigvals = np.maximum(eigvals, min_eig)
     return eigvecs @ np.diag(new_eigvals) @ eigvecs.T
 
@@ -250,8 +245,8 @@ def dcc_likelihood_full(z_std, H_indicator, Q_bar, params):
             D_inv = np.diag(1 / diag_q)
             R_t = D_inv @ Q_t @ D_inv
             
-            # Asegurar definida-positividad
-            min_eig_R = np.min(np.linalg.eigsh(R_t))
+            # Asegurar definida-positividad (Corregido np.linalg.eigsh a eigvalsh)
+            min_eig_R = np.min(np.linalg.eigvalsh(R_t))
             if min_eig_R < 1e-4:
                 R_t = R_t + (1e-4 - min_eig_R) * np.eye(N)
             
@@ -333,7 +328,7 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None):
     # Matriz de estrés
     stress_periods = z_std[H_indicator == 1]
     Q_stress = np.corrcoef(stress_periods.T) if len(stress_periods) > 10 else Q_bar.copy()
-    Q_stress = ensureinite(Q_stress, min_eig=1e-6)
+    Q_stress = ensure_positive_definite(Q_stress, min_eig=1e-6)
     
     # Evolución de Q_t
     Q_t = np.zeros((T, N, N))
@@ -558,7 +553,7 @@ def plot_correlation_heatmap(R_t, dates, tickers, title="Matriz de Correlación"
         y=tickers,
         colorscale='RdBu',
         zmid=0,
- text=np.round(avg_corr, 2),
+        text=np.round(avg_corr, 2),
         texttemplate="%{text}",
         textfont={"size": 10}
     ))
@@ -746,7 +741,7 @@ def main():
     
     tickers_input = st.sidebar.text_area(
         "Tickers (separados por coma)",
-        value=", ".join_tickers),
+        value=", ".join(default_tickers),
         help="Ejemplo: ^GSPC, TLT, GLD, UUP"
     )
     tickers = [t.strip() for t in tickers_input.split(",") if t.strip()]
@@ -1076,7 +1071,7 @@ def main():
                         )
                         
                         # Conclusión OoS
-                        if oos_results['backtest_oos']['violations'] <= oos_results['backtest_standard']['violaciones']:
+                        if oos_results['backtest_oos']['violations'] <= oos_results['backtest_standard']['violations']:
                             st.success("""
                             **✅ El modelo DCC-H muestra mejor performance out-of-sample:**
                             - Menos violaciones de VaR que el DCC estándar
@@ -1193,7 +1188,7 @@ def main():
             st.code("VIX - Volatility Index")
         
         st.markdown("**📦 Commodities & Otros**")
-        st.code("USO - Oil", "HYG - High Yield Bonds", "FXE - Euro", "BTC-USD - Bitcoin")
+        st.code("USO - Oil\nHYG - High Yield Bonds\nFXE - Euro\nBTC-USD - Bitcoin")
 
 # ============================================================================
 # 🚀 EJECUCIÓN
