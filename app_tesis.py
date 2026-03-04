@@ -2,7 +2,7 @@
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
 # Archivo: app_tesis.py
-# Versión: FINAL CORREGIDA Y RIGUROSA (Con violaciones dinámicas en conclusiones)
+# Versión: FINAL PARA DEFENSA DOCTORAL
 # Ejecutar: streamlit run app_tesis.py
 # ============================================================================
 
@@ -53,7 +53,7 @@ def download_data(tickers, start_date, end_date):
     try:
         data = yf.download(tickers, start=start_date, end=end_date, progress=False)
         
-        if data is None or data.empty:
+        if data is None or (hasattr(data, 'empty') and data.empty):
             return None
         
         # Manejar estructura MultiIndex (múltiples activos)
@@ -72,21 +72,21 @@ def download_data(tickers, start_date, end_date):
                 prices = data[['Close']].copy()
             else:
                 prices = data.copy()
-            
-            if len(prices.columns) == 1 and len(tickers) == 1:
-                prices.columns = tickers
-            elif len(prices.columns) == 1:
-                prices.columns = [tickers[0]]
+        
+        if len(prices.columns) == 1 and len(tickers) == 1:
+            prices.columns = tickers
+        elif len(prices.columns) == 1:
+            prices.columns = [tickers[0]]
         
         if isinstance(prices, pd.Series):
             prices = prices.to_frame(name=tickers[0])
-            
+        
         # 1. Eliminar activos que no existían en absoluto (columnas 100% NaN)
         prices = prices.dropna(axis=1, how='all')
         
         if prices.empty or prices.shape[1] == 0:
             return None
-            
+        
         # 2. Rellenar huecos internos (festivos) hacia adelante
         prices = prices.ffill()
         
@@ -95,8 +95,9 @@ def download_data(tickers, start_date, end_date):
         
         if prices.empty or prices.shape[0] < 10:
             return None
-            
+        
         return prices
+    
     except Exception as e:
         st.error(f"❌ Error descargando datos: {str(e)}")
         return None
@@ -123,7 +124,7 @@ def garch_filter(returns):
     """
     if isinstance(returns, pd.Series):
         returns = returns.to_frame()
-        
+    
     n = len(returns)
     N = len(returns.columns)
     
@@ -392,7 +393,7 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None):
         except Exception as e:
             Q_t[t] = Q_t[t-1] if t > 0 else Q_bar
             R_t[t] = R_t[t-1] if t > 0 else Q_bar
-            
+    
     # Asignar también el R_t inicial
     diag_q0 = np.sqrt(np.diag(Q_t[0]))
     diag_q0 = np.clip(diag_q0, 1e-8, None)
@@ -445,6 +446,7 @@ def likelihood_ratio_test(z_std, H_indicator, Q_bar):
             'params_restricted': result_restricted.x,
             'params_unrestricted': result_unrestricted.x
         }
+    
     except Exception as e:
         return {
             'lr_statistic': 0.0,
@@ -491,7 +493,7 @@ def calculate_var(returns, R_t, sigma_matrix, weights=None, confidence=0.95):
 
 def backtest_var(returns, var_series, confidence=0.95):
     """Backtesting de VaR (Kupiec Test)"""
-    portfolio_return = returns.mean(axis=1)  # Retorno de portafolio equally weighted
+    portfolio_return = returns.mean(axis=1)
     violations = (portfolio_return < -var_series).astype(int)
     
     n_violations = violations.sum()
@@ -524,14 +526,16 @@ def backtest_var(returns, var_series, confidence=0.95):
 # 📊 VALIDACIÓN OUT-OF-SAMPLE
 # ============================================================================
 
-def out_of_sample_validation(prices, valid_tickers, train_ratio=0.7, confidence_gumbel=0.95, kappa_threshold=0.3, var_confidence=0.95, garch_window=252):
+def out_of_sample_validation(prices, valid_tickers, train_ratio=0.7, confidence_gumbel=0.95, 
+                             kappa_threshold=0.3, var_confidence=0.95, garch_window=252):
     """
     Validación Out-of-Sample pura evitando el Look-Ahead Bias.
     """
     returns = calculate_returns(prices)
+    
     if len(returns.columns) < 2:
         return None, "Se requieren al menos 2 activos para el modelo DCC."
-        
+    
     n_obs = len(returns)
     n_train = int(n_obs * train_ratio)
     
@@ -593,7 +597,7 @@ def out_of_sample_validation(prices, valid_tickers, train_ratio=0.7, confidence_
 
 def plot_correlation_heatmap(R_t, dates, tickers, title="Matriz de Correlación"):
     """Heatmap de correlaciones"""
-    avg_corr = np.mean(R_t[-60:], axis=0)  # Últimos 60 días
+    avg_corr = np.mean(R_t[-60:], axis=0)
     
     fig = go.Figure(data=go.Heatmap(
         z=avg_corr,
@@ -795,11 +799,14 @@ def main():
     tickers = [t.strip() for t in tickers_input.split(",") if t.strip()]
     
     # Selección de período con pandemia automática
-    st.sidebar.subheader("2. Período de Análisis (PANDERMIA AUTOMÁTICA)")
+    st.sidebar.subheader("2. Período de Análisis")
+    
     regime_option = st.sidebar.selectbox(
         "Selecciona el régimen",
         [
-            "✅ COVID-19 Pandemia (Enero-Junio 2020) - RECOMENDADO PARA TESIS",
+            "✅ COVID-19 Pandemia (Enero-Junio 2020) - RECOMENDADO",
+            "COVID-19 Completo (2020)",
+            "COVID-19 Extendido (2020-2021)",
             "Crisis Financiera Global (2008)",
             "Crisis Eurozona (2011)",
             "Periodo Normal (2018-2019)",
@@ -808,21 +815,33 @@ def main():
     )
     
     # Definir fechas según selección
-    if regime_option == "✅ COVID-19 Pandemia (Enero-Junio 2020) - RECOMENDADO PARA TESIS":
+    if regime_option == "✅ COVID-19 Pandemia (Enero-Junio 2020) - RECOMENDADO":
         start_date = datetime(2020, 1, 1)
         end_date = datetime(2020, 6, 30)
         st.sidebar.success("✔️ Período COVID-19 establecido: 2020-01-01 a 2020-06-30")
-        
-        # Umbrales optimizados para crisis
         confidence_gumbel = st.sidebar.slider("Confianza Gumbel (α)", 0.95, 0.99, 0.985, 0.005)
         kappa_threshold = st.sidebar.slider("Umbral Sistémico (κ)", 0.3, 0.6, 0.50, 0.05)
+        
+    elif regime_option == "COVID-19 Completo (2020)":
+        start_date = datetime(2020, 1, 1)
+        end_date = datetime(2020, 12, 31)
+        st.sidebar.success("✔️ Período COVID-19 2020 establecido")
+        confidence_gumbel = st.sidebar.slider("Confianza Gumbel (α)", 0.95, 0.99, 0.99, 0.005)
+        kappa_threshold = st.sidebar.slider("Umbral Sistémico (κ)", 0.3, 0.6, 0.60, 0.05)
+        
+    elif regime_option == "COVID-19 Extendido (2020-2021)":
+        start_date = datetime(2020, 1, 1)
+        end_date = datetime(2021, 12, 31)
+        st.sidebar.success("✔️ Período COVID-19 Extendido establecido")
+        confidence_gumbel = st.sidebar.slider("Confianza Gumbel (α)", 0.95, 0.99, 0.99, 0.005)
+        kappa_threshold = st.sidebar.slider("Umbral Sistémico (κ)", 0.3, 0.6, 0.60, 0.05)
         
     elif regime_option == "Crisis Financiera Global (2008)":
         start_date = datetime(2008, 1, 1)
         end_date = datetime(2008, 12, 31)
         st.sidebar.success("✔️ Período Crisis 2008 establecido")
-        confidence_gumbel = st.sidebar.slider("Confianza Gumbel (α)", 0.95, 0.99, 0.99, 0.005)
-        kappa_threshold = st.sidebar.slider("Umbral Sistémico (κ)", 0.3, 0.6, 0.55, 0.05)
+        confidence_gumbel = st.sidebar.slider("Confianza Gumbel (α)", 0.95, 0.99, 0.95, 0.005)
+        kappa_threshold = st.sidebar.slider("Umbral Sistémico (κ)", 0.3, 0.6, 0.30, 0.05)
         
     elif regime_option == "Crisis Eurozona (2011)":
         start_date = datetime(2011, 1, 1)
@@ -880,17 +899,17 @@ def main():
             valid_tickers = returns.columns.tolist()
             
             if len(valid_tickers) < 2:
-                st.error("❌ El modelo DCC-GARCH requiere al menos 2 activos concurrentes. Los datos disponibles en las fechas dadas no son suficientes.")
+                st.error("❌ El modelo DCC-GARCH requiere al menos 2 activos concurrentes.")
                 st.stop()
-                
+            
             if len(returns) < 50:
-                st.error(f"❌ Solo se obtuvieron {len(returns)} días de datos conjuntos. Se requieren al menos 50 observaciones para la convergencia del modelo.")
+                st.error(f"❌ Solo se obtuvieron {len(returns)} días de datos. Se requieren al menos 50 observaciones.")
                 st.stop()
-                
+            
             dropped_tickers = set(tickers) - set(valid_tickers)
             if dropped_tickers:
-                st.warning(f"⚠️ Los siguientes activos fueron excluidos automáticamente porque carecen de historial de precios en el período analizado: {', '.join(dropped_tickers)}")
-                
+                st.warning(f"⚠️ Activos excluidos (sin historial en este período): {', '.join(dropped_tickers)}")
+            
             col1, col2, col3 = st.columns(3)
             with col1:
                 st.metric("Activos Listos", len(valid_tickers))
@@ -899,7 +918,6 @@ def main():
             with col3:
                 st.metric("Observaciones", len(returns))
             
-            # Mostrar datos
             with st.expander("📋 Ver Datos de Precios"):
                 st.dataframe(prices.tail(10))
             
@@ -924,7 +942,6 @@ def main():
             thresholds, indicators = fit_gumbel_threshold(z_std, confidence_gumbel, garch_window)
             H_t, prop_stressed = calculate_systemic_indicator(indicators, kappa_threshold)
             
-            # Mostrar umbrales
             col1, col2 = st.columns(2)
             with col1:
                 st.markdown("**📊 Umbrales por Activo (Gumbel)**")
@@ -939,10 +956,8 @@ def main():
                 st.metric("Días en Homeostasis", int(H_t.sum()))
                 st.metric("Porcentaje del Tiempo", f"{H_t.mean()*100:.1f}%")
             
-            # Gráfico de indicador homeostático
             st.plotly_chart(
-                plot_homeostatic_indicator(H_t.values, prop_stressed.values, 
-                                          prop_stressed.index),
+                plot_homeostatic_indicator(H_t.values, prop_stressed.values, prop_stressed.index),
                 use_container_width=True
             )
             
@@ -962,14 +977,12 @@ def main():
             with col3:
                 st.metric("Parámetro γ (homeostasis)", f"{params['gamma']:.3f}")
             
-            # Heatmap de correlaciones
             st.plotly_chart(
                 plot_correlation_heatmap(R_t, returns.index, valid_tickers, 
                                         "Matriz de Correlación Promedio (Últimos 60 días)"),
                 use_container_width=True
             )
             
-            # Selector de par para serie temporal de correlación
             st.markdown("**Seleccionar par de activos para ver evolución de correlación:**")
             col1, col2 = st.columns(2)
             with col1:
@@ -992,29 +1005,22 @@ def main():
             with st.spinner("Ejecutando Test LR..."):
                 lr_results = likelihood_ratio_test(z_std, H_t, Q_bar)
                 
-                # Mostrar resultados en métricas
                 col1, col2, col3, col4 = st.columns(4)
-                
                 with col1:
                     st.metric("Estadístico LR", f"{lr_results['lr_statistic']:.4f}")
-                
                 with col2:
                     st.metric("Valor Crítico (5%)", f"{lr_results['critical_value']:.4f}")
-                
                 with col3:
                     st.metric("P-value", f"{lr_results['p_value']:.6f}")
-                
                 with col4:
                     if lr_results['decision'] == "RECHAZAR_H0":
                         st.success("✅ H0 Rechazada")
                     else:
                         st.error("❌ H0 No Rechazada")
                 
-                # Interpretación
                 if lr_results['decision'] == "RECHAZAR_H0":
                     st.success("""
                     **✅ Este resultado valida tu contribución doctoral:**
-                    
                     1. El parámetro γ es estadísticamente significativo (p < 0.05)
                     2. El modelo DCC-H explica mejor los datos que el DCC estándar
                     3. **La hipótesis H2 de tu tesis está respaldada empíricamente**
@@ -1023,7 +1029,6 @@ def main():
                 else:
                     st.warning("""
                     **⚠️ Consideraciones:**
-                    
                     1. El parámetro γ no es estadísticamente significativo en este período
                     2. Esto NO invalida tu tesis, pero sugiere:
                        - Probar con otros períodos (crisis 2008, COVID-19)
@@ -1031,9 +1036,7 @@ def main():
                        - El efecto homeostático puede ser específico de ciertos regímenes
                     """)
                 
-                # Tabla comparativa de modelos
                 st.markdown("### 📊 Comparación de Modelos")
-                
                 comparison_df = pd.DataFrame({
                     'Modelo': ['DCC Estándar', 'DCC Homeostático'],
                     'Parámetros': [2, 3],
@@ -1058,9 +1061,7 @@ def main():
             var_series = calculate_var(returns, R_t, sigma, confidence=var_confidence)
             backtest_results = backtest_var(returns, var_series, var_confidence)
             
-            # Métricas de backtesting
             col1, col2, col3, col4 = st.columns(4)
-            
             with col1:
                 st.metric("Violaciones Observadas", backtest_results['violations'])
             with col2:
@@ -1070,13 +1071,11 @@ def main():
             with col4:
                 st.metric("Tasa Esperada", f"{backtest_results['expected_rate']*100:.2f}%")
             
-            # Resultado del test Kupiec
             if backtest_results['passed']:
                 st.success(f"✅ Test de Kupiec APROBADO (p-value: {backtest_results['kupiec_pvalue']:.4f})")
             else:
                 st.error(f"❌ Test de Kupiec RECHAZADO (p-value: {backtest_results['kupiec_pvalue']:.4f})")
             
-            # Gráfico de VaR
             st.plotly_chart(
                 plot_var_backtesting(returns, var_series, returns.index),
                 use_container_width=True
@@ -1085,7 +1084,7 @@ def main():
             # 7. Validación Out-of-Sample
             if enable_oos:
                 st.markdown("---")
-                st.markdown('<p class="sub-header">🔬 7. Validación Out-of-Sample pura (Evitando Look-Ahead Bias)</p>', 
+                st.markdown('<p class="sub-header">🔬 7. Validación Out-of-Sample pura</p>', 
                            unsafe_allow_html=True)
                 
                 with st.spinner("Ejecutando validación predictiva Out-of-Sample..."):
@@ -1105,7 +1104,6 @@ def main():
                             st.info(f"**Período Prueba:** {oos_results['test_period']}")
                             st.info(f"**Observaciones Test:** {oos_results['n_test']}")
                         
-                        # Comparación de backtesting
                         st.markdown("### 📊 Comparación Pura en Prueba de Estrés Predictivo: DCC-H vs DCC Estándar")
                         
                         comparison_oos = pd.DataFrame({
@@ -1126,27 +1124,26 @@ def main():
                         
                         st.dataframe(comparison_oos)
                         
-                        # Gráfico OoS
                         st.plotly_chart(
                             plot_out_of_sample_comparison(oos_results),
                             use_container_width=True
                         )
                         
-                        # Conclusión OoS con Variables Dinámicas
                         v_oos = oos_results['backtest_oos']['violations']
                         v_std = oos_results['backtest_standard']['violations']
                         
                         if v_oos <= v_std:
                             st.success(f"""
                             **✅ El modelo DCC-H muestra mejor performance out-of-sample:**
-                            - Presenta la misma cantidad o menos violaciones que el modelo estándar en datos que "nunca había visto" **(DCC-H: {v_oos} violaciones vs Estándar: {v_std} violaciones)**.
-                            - Posee un fuerte nivel de generalización. Validando contundentemente las conclusiones de la Tesis.
+                            - Presenta la misma cantidad o menos violaciones que el modelo estándar
+                            - **DCC-H: {v_oos} violaciones vs Estándar: {v_std} violaciones**
+                            - Posee un fuerte nivel de generalización
                             """)
                         else:
                             st.warning(f"""
-                            **⚠️ El modelo DCC-H tiene más violaciones en out-of-sample que el estándar (DCC-H: {v_oos} vs Estándar: {v_std}):**
-                            - Puede indicar cierto nivel de overfitting durante el periodo de entrenamiento.
-                            - Podría ser útil ensanchar la ventana de medición, o reajustar los parámetros en este periodo.
+                            **⚠️ El modelo DCC-H tiene más violaciones en out-of-sample:**
+                            - DCC-H: {v_oos} vs Estándar: {v_std}
+                            - Puede indicar cierto nivel de overfitting
                             """)
             
             # 8. Exportar resultados
@@ -1157,7 +1154,6 @@ def main():
             col1, col2 = st.columns(2)
             
             with col1:
-                # Exportar series temporales
                 results_df = pd.DataFrame({
                     'Date': returns.index,
                     'H_Indicator': H_t.values,
@@ -1174,7 +1170,6 @@ def main():
                 )
             
             with col2:
-                # Exportar resumen
                 summary = {
                     'Modelo': 'DCC-GARCH Homeostático',
                     'Activos': len(valid_tickers),
@@ -1207,29 +1202,28 @@ def main():
         
         #### ¿Qué hace este modelo?
         
-        1. **📊 Filtrado GARCH**: Extrae residuos estandarizados y matrices de volatilidad condicional de manera rigurosa.
-        2. **🎯 Teoría de Valores Extremos**: Ajusta distribución de Gumbel para detectar eventos extremos.
-        3. **🏠 Indicador Homeostático**: Identifica cuando el sistema está en "tensión" (H_t = 1).
-        4. **🔗 DCC Modificado**: La correlación dinámica cambia según el régimen homeostático extraído matemáticamente.
-        5. **🧪 Test LR**: Valida estadísticamente que el componente homeostático (γ) aporta significativamente al modelo.
-        6. **🔬 Out-of-Sample Puro**: Prueba el modelo en datos nunca vistos esquivando cualquier sesgo algorítmico retrospectivo.
-        7. **⚠️ VaR Condicional**: Calcula un Value-at-Risk que usa la reconstrucción matricial matemática exacta del portafolio.
+        1. **📊 Filtrado GARCH**: Extrae residuos estandarizados y matrices de volatilidad condicional
+        2. **🎯 Teoría de Valores Extremos**: Ajusta distribución de Gumbel para detectar eventos extremos
+        3. **🏠 Indicador Homeostático**: Identifica cuando el sistema está en "tensión" (H_t = 1)
+        4. **🔗 DCC Modificado**: La correlación dinámica cambia según el régimen homeostático
+        5. **🧪 Test LR**: Valida estadísticamente que el componente homeostático (γ) aporta significativamente
+        6. **🔬 Out-of-Sample Puro**: Prueba el modelo en datos nunca vistos evitando look-ahead bias
+        7. **⚠️ VaR Condicional**: Calcula un Value-at-Risk que usa la reconstrucción matricial exacta
         
         #### Hipótesis que se pueden testear:
         
-        - **H1**: Los umbrales de Gumbel predicen mejor los eventos extremos que la distribución normal.
-        - **H2**: Las correlaciones cambian significativamente cuando H_t = 1 **(Validado con Test LR)**.
-        - **H3**: El VaR condicional sistémico tiene mayor validez (Kupiec Test robusto).
+        - **H1**: Los umbrales de Gumbel predicen mejor los eventos extremos que la distribución normal
+        - **H2**: Las correlaciones cambian significativamente cuando H_t = 1 **(Validado con Test LR)**
+        - **H3**: El VaR condicional sistémico tiene mayor validez (Kupiec Test robusto)
         
         ---
         
         <div class="warning-box">
-        <strong>⚠️ Nota Académica:</strong> Esta aplicación es para fines de investigación académica. Se construyó respetando 
-        el rigor matemático necesario para sustentación Doctoral.
+        <strong>⚠️ Nota Académica:</strong> Esta aplicación es para fines de investigación académica. 
+        Se construyó respetando el rigor matemático necesario para sustentación Doctoral.
         </div>
         """, unsafe_allow_html=True)
         
-        # Mostrar tickers recomendados
         st.markdown('<p class="sub-header">📋 Tickers Recomendados para Investigación</p>', 
                    unsafe_allow_html=True)
         
@@ -1250,7 +1244,7 @@ def main():
             st.code("VIX - Volatility Index")
         
         st.markdown("**📦 Commodities & Otros**")
-        st.code("USO - Oil", "HYG - High Yield Bonds", "FXE - Euro", "BTC-USD - Bitcoin")
+        st.code("USO - Oil | HYG - High Yield Bonds | FXE - Euro | BTC-USD - Bitcoin")
 
 # ============================================================================
 # 🚀 EJECUCIÓN
