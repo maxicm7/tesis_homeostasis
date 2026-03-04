@@ -2,7 +2,7 @@
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
 # Archivo: app_tesis.py
-# Versión: FINAL CORREGIDA Y RIGUROSA (Protección contra NaNs y Activos Faltantes)
+# Versión: FINAL CORREGIDA Y RIGUROSA (Con violaciones dinámicas en conclusiones)
 # Ejecutar: streamlit run app_tesis.py
 # ============================================================================
 
@@ -1132,16 +1132,19 @@ def main():
                             use_container_width=True
                         )
                         
-                        # Conclusión OoS
-                        if oos_results['backtest_oos']['violations'] <= oos_results['backtest_standard']['violations']:
-                            st.success("""
+                        # Conclusión OoS con Variables Dinámicas
+                        v_oos = oos_results['backtest_oos']['violations']
+                        v_std = oos_results['backtest_standard']['violations']
+                        
+                        if v_oos <= v_std:
+                            st.success(f"""
                             **✅ El modelo DCC-H muestra mejor performance out-of-sample:**
-                            - Presenta la misma cantidad o menos violaciones que el modelo estándar en datos que "nunca había visto".
+                            - Presenta la misma cantidad o menos violaciones que el modelo estándar en datos que "nunca había visto" **(DCC-H: {v_oos} violaciones vs Estándar: {v_std} violaciones)**.
                             - Posee un fuerte nivel de generalización. Validando contundentemente las conclusiones de la Tesis.
                             """)
                         else:
-                            st.warning("""
-                            **⚠️ El modelo DCC-H tiene más violaciones en out-of-sample que el estándar:**
+                            st.warning(f"""
+                            **⚠️ El modelo DCC-H tiene más violaciones en out-of-sample que el estándar (DCC-H: {v_oos} vs Estándar: {v_std}):**
                             - Puede indicar cierto nivel de overfitting durante el periodo de entrenamiento.
                             - Podría ser útil ensanchar la ventana de medición, o reajustar los parámetros en este periodo.
                             """)
