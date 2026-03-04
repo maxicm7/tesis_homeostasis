@@ -1,9 +1,9 @@
 # ============================================================================
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
-# Archivo: app_tesis_final.py
-# Versión: FINAL - CORREGIDO PARA PERÍODO DE PANDEMIA (2020)
-# Ejecutar: streamlit run app_tesis_final.py
+# Archivo: app_tesis.py
+# Versión: FINAL CORREGIDA (sin errores de indentación)
+# Ejecutar: streamlit run app_tesis.py
 # ============================================================================
 
 import streamlit as st
@@ -49,14 +49,14 @@ st.markdown("""
 
 @st.cache_data(ttl=7200)
 def download_data(tickers, start_date, end_date):
-    """Descarga datos desde Yahoo Finance - VERSIÓN CORREGIDA 2024"""
+    """Descarga datos desde Yahoo Finance"""
     try:
         data = yf.download(tickers, start=start_date, end=end_date, progress=False, auto_adjust=True)
         
-        if data is None:
+        if data is None or (hasattr(data, 'empty') and data.empty):
             return None
         
-        # Manejar estructura MultiIndex (nueva de yfinance)
+        # Manejar estructura MultiIndex
         if isinstance(data.columns, pd.MultiIndex):
             prices_dict = {}
             for ticker in tickers:
@@ -68,10 +68,8 @@ def download_data(tickers, start_date, end_date):
             if prices_dict:
                 prices = pd.DataFrame(prices_dict)
             else:
-                # Fallback: usar primera columna por ticker
                 prices = data.iloc[:, :len(tickers)]
         else:
-            # Estructura antigua
             if 'Adj Close' in data.columns:
                 prices = data['Adj Close']
             elif 'Close' in data.columns:
@@ -79,7 +77,7 @@ def download_data(tickers, start_date, end_date):
             else:
                 prices = data.iloc[:, :len(tickers)]
         
-        # Limpieza
+        # Limpieza de datos
         prices = prices.dropna(how='all').ffill().bfill()
         
         if prices.empty or prices.shape[1] == 0:
@@ -215,7 +213,7 @@ def dcc_likelihood_full(z_std, H_indicator, Q_bar, params):
     b = max(params[1], 1e-8)
     gamma = max(params[2], 1e-8) if len(params) > 2 else 0.0
     
-    # Restricciones estrictas para estabilidad
+    # Restricciones para estabilidad
     if a + b + gamma >= 0.98 or a > 0.5 or b > 0.95:
         return -1000.0
     
@@ -250,8 +248,8 @@ def dcc_likelihood_full(z_std, H_indicator, Q_bar, params):
             D_inv = np.diag(1 / diag_q)
             R_t = D_inv @ Q_t @ D_inv
             
-            # Asegurar definida-positividad
-            min_eig_R = np.min(np.linalg.eigsh(R_t))
+            # Validar definida-positividad
+            min_eig_R = np.min(np.linalg.eigvalsh(R_t))
             if min_eig_R < 1e-4:
                 R_t = R_t + (1e-4 - min_eig_R) * np.eye(N)
             
@@ -311,8 +309,8 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None):
     """
     Implementación del DCC-GARCH Homeostático
     """
-    if z_std is None:
-        raise ValueError("z_std no puede ser nulo")
+    if z_std is None or z_std.empty:
+        raise ValueError("z_std no puede ser nulo o vacío")
     
     T = len(z_std)
     N = z_std.shape[1]
@@ -333,7 +331,7 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None):
     # Matriz de estrés
     stress_periods = z_std[H_indicator == 1]
     Q_stress = np.corrcoef(stress_periods.T) if len(stress_periods) > 10 else Q_bar.copy()
-    Q_stress = ensureinite(Q_stress, min_eig=1e-6)
+    Q_stress = ensure_positive_definite(Q_stress, min_eig=1e-6)
     
     # Evolución de Q_t
     Q_t = np.zeros((T, N, N))
@@ -380,19 +378,17 @@ def likelihood_ratio_test(z_std, H_indicator, Q_bar):
         # Modelo restringido (DCC estándar, γ = 0)
         result_restricted = estimate_dcc_parameters(z_std, H_indicator, Q_bar, 'DCC')
         log_lik_restricted = -result_restricted.fun
-        params_restricted = result_restricted.x
         
         # Modelo no restringido (DCC-H con γ libre)
         result_unrestricted = estimate_dcc_parameters(z_std, H_indicator, Q_bar, 'DCC-H')
         log_lik_unrestricted = -result_unrestricted.fun
-        params_unrestricted = result_unrestricted.x
         
         # Estadístico LR
         lr_stat = 2 * (log_lik_unrestricted - log_lik_restricted)
         lr_stat = float(np.clip(lr_stat, 0, 1e6))
         
         # Grados de libertad
-        df = len(params_unrestricted) - len(params_restricted)
+        df = len(result_unrestricted.x) - len(result_restricted.x)
         
         # P-value
         p_value = 1 - chi2.cdf(lr_stat, df) if lr_stat > 0 else 1.0
@@ -411,8 +407,8 @@ def likelihood_ratio_test(z_std, H_indicator, Q_bar):
             'decision': decision,
             'log_lik_restricted': log_lik_restricted,
             'log_lik_unrestricted': log_lik_unrestricted,
-            'params_restricted': params_restricted,
-            'params_unrestricted': params_unrestricted
+            'params_restricted': result_restricted.x,
+            'params_unrestricted': result_unrestricted.x
         }
     except Exception as e:
         return {
@@ -558,7 +554,7 @@ def plot_correlation_heatmap(R_t, dates, tickers, title="Matriz de Correlación"
         y=tickers,
         colorscale='RdBu',
         zmid=0,
- text=np.round(avg_corr, 2),
+        text=np.round(avg_corr, 2),
         texttemplate="%{text}",
         textfont={"size": 10}
     ))
@@ -712,7 +708,7 @@ def plot_out_of_sample_comparison(results):
     return fig
 
 # ============================================================================
-# 🖥️ INTERFAZ STREAMLIT PRINCIPAL - CON SELECCIÓN AUTOMÁTICA DE PANDEMIA
+# 🖥️ INTERFAZ STREAMLIT PRINCIPAL
 # ============================================================================
 
 def main():
@@ -746,12 +742,12 @@ def main():
     
     tickers_input = st.sidebar.text_area(
         "Tickers (separados por coma)",
-        value=", ".join_tickers),
+        value=", ".join(default_tickers),
         help="Ejemplo: ^GSPC, TLT, GLD, UUP"
     )
     tickers = [t.strip() for t in tickers_input.split(",") if t.strip()]
     
-    # 🔑 CAMBIO CLAVE: Selección automática de período de pandemia
+    # Selección de período con pandemia automática
     st.sidebar.subheader("2. Período de Análisis (PANDERMIA AUTOMÁTICA)")
     regime_option = st.sidebar.selectbox(
         "Selecciona el régimen",
@@ -978,7 +974,7 @@ def main():
                 st.markdown("### 📊 Comparación de Modelos")
                 
                 comparison_df = pd.DataFrame({
-                    'Modelo': ['D Estándar', 'DCC Homeostático'],
+                    'Modelo': ['DCC Estándar', 'DCC Homeostático'],
                     'Parámetros': [2, 3],
                     'Log-Likelihood': [lr_results['log_lik_restricted'], lr_results['log_lik_unrestricted']],
                     'AIC': [-2*lr_results['log_lik_restricted'] + 2*2, 
@@ -1076,7 +1072,7 @@ def main():
                         )
                         
                         # Conclusión OoS
-                        if oos_results['backtest_oos']['violations'] <= oos_results['backtest_standard']['violaciones']:
+                        if oos_results['backtest_oos']['violations'] <= oos_results['backtest_standard']['violations']:
                             st.success("""
                             **✅ El modelo DCC-H muestra mejor performance out-of-sample:**
                             - Menos violaciones de VaR que el DCC estándar
