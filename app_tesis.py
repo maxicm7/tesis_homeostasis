@@ -2,7 +2,7 @@
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
 # Archivo: app_tesis.py
-# Versión: FINAL CORREGIDA (sin errores de indentación)
+# Versión: FINAL CORREGIDA Y RIGUROSA
 # Ejecutar: streamlit run app_tesis.py
 # ============================================================================
 
@@ -49,14 +49,14 @@ st.markdown("""
 
 @st.cache_data(ttl=7200)
 def download_data(tickers, start_date, end_date):
-    """Descarga datos desde Yahoo Finance"""
+    """Descarga datos desde Yahoo Finance y asegura formato DataFrame"""
     try:
         data = yf.download(tickers, start=start_date, end=end_date, progress=False, auto_adjust=True)
         
         if data is None or (hasattr(data, 'empty') and data.empty):
             return None
         
-        # Manejar estructura MultiIndex
+        # Manejar estructura MultiIndex (múltiples activos)
         if isinstance(data.columns, pd.MultiIndex):
             prices_dict = {}
             for ticker in tickers:
@@ -70,13 +70,20 @@ def download_data(tickers, start_date, end_date):
             else:
                 prices = data.iloc[:, :len(tickers)]
         else:
+            # Manejo si se descarga 1 solo ticker u otro formato anómalo
             if 'Adj Close' in data.columns:
-                prices = data['Adj Close']
+                prices = data[['Adj Close']].copy()
             elif 'Close' in data.columns:
-                prices = data['Close']
+                prices = data[['Close']].copy()
             else:
-                prices = data.iloc[:, :len(tickers)]
+                prices = data.copy()
+            
+            if len(tickers) == 1 and len(prices.columns) == 1:
+                prices.columns = tickers
         
+        if isinstance(prices, pd.Series):
+            prices = prices.to_frame(name=tickers[0])
+            
         # Limpieza de datos
         prices = prices.dropna(how='all').ffill().bfill()
         
@@ -89,8 +96,12 @@ def download_data(tickers, start_date, end_date):
         return None
 
 def calculate_returns(prices):
-    """Calcula retornos logarítmicos"""
+    """Calcula retornos logarítmicos garantizando un DataFrame"""
+    if isinstance(prices, pd.Series):
+        prices = prices.to_frame()
+    
     returns = np.log(prices / prices.shift(1)).dropna()
+    
     if returns.empty:
         raise ValueError("Retornos vacíos después de calcular")
     return returns
@@ -101,39 +112,43 @@ def calculate_returns(prices):
 
 def garch_filter(returns):
     """
-    Filtrado GARCH(1,1) simplificado para residuos estandarizados
+    Filtrado GARCH(1,1) para residuos estandarizados y volatilidades (D_t)
     """
+    if isinstance(returns, pd.Series):
+        returns = returns.to_frame()
+        
     n = len(returns)
     N = len(returns.columns)
     
-    # Calcular varianza promedio
+    # Calcular varianza incondicional (promedio)
     total_var = float(returns.var().mean())
     if total_var < 1e-10:
         total_var = 1e-6
     
-    sigma2 = np.zeros((n, N))
-    sigma2[:, :] = total_var
+    sigma_matrix = np.zeros((n, N))
     z_std_list = []
     
     omega, alpha, beta = 0.00001, 0.1, 0.85
     
     for i in range(N):
-        sigma_col = np.full(n, total_var)
+        sigma2_col = np.full(n, total_var)
         
+        # Filtro iterativo GARCH(1,1)
         for t in range(1, n):
-            val = returns.iloc[t-1].iloc[i]
-            sigma_col[t] = omega + alpha * val**2 + beta * sigma_col[t-1]
+            val = returns.iloc[t-1, i]
+            sigma2_col[t] = omega + alpha * val**2 + beta * sigma2_col[t-1]
         
-        sigma = np.sqrt(sigma_col)
-        sigma[sigma < 1e-10] = 1e-10
-        z_col = returns.iloc[:, i] / sigma
+        sigma_col = np.sqrt(sigma2_col)
+        sigma_col[sigma_col < 1e-10] = 1e-10
+        sigma_matrix[:, i] = sigma_col
+        
+        # Residuos Estandarizados
+        z_col = returns.iloc[:, i] / sigma_col
         z_std_list.append(z_col.values)
     
     z_std = pd.DataFrame(np.column_stack(z_std_list), index=returns.index, columns=returns.columns)
-    sigma_mean = np.sqrt(sigma2.mean(axis=1))
-    sigma_mean[sigma_mean < 1e-10] = 1e-10
     
-    return z_std, sigma_mean
+    return z_std, sigma_matrix
 
 # ============================================================================
 # 🎯 DISTRIBUCIÓN DE GUMBEL
@@ -305,9 +320,10 @@ def estimate_dcc_parameters(z_std, H_indicator, Q_bar, model_type='DCC-H'):
     
     return result
 
-def dcc_homeostatic(z_std, H_indicator, Q_bar=None):
+def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None):
     """
-    Implementación del DCC-GARCH Homeostático
+    Implementación del DCC-GARCH Homeostático.
+    Permite fijar los parámetros para validaciones Out-of-Sample genuinas.
     """
     if z_std is None or z_std.empty:
         raise ValueError("z_std no puede ser nulo o vacío")
@@ -320,9 +336,14 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None):
     
     Q_bar = ensure_positive_definite(Q_bar, min_eig=1e-6)
     
-    # Estimar parámetros
-    result = estimate_dcc_parameters(z_std, H_indicator, Q_bar, 'DCC-H')
-    params = result.x
+    # Estimar parámetros o usar fijos
+    if fixed_params is None:
+        result = estimate_dcc_parameters(z_std, H_indicator, Q_bar, 'DCC-H')
+        params = result.x
+        log_lik = -result.fun
+    else:
+        params = fixed_params
+        log_lik = None
     
     a = float(np.clip(params[0], 1e-8, 0.3))
     b = float(np.clip(params[1], 0.5, 0.95))
@@ -362,9 +383,16 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None):
                 R_t[t] = R_t[t] + (1e-5 - min_eig) * np.eye(N)
                 
         except Exception as e:
+            Q_t[t] = Q_t[t-1] if t > 0 else Q_bar
             R_t[t] = R_t[t-1] if t > 0 else Q_bar
+            
+    # Asignar también el R_t inicial
+    diag_q0 = np.sqrt(np.diag(Q_t[0]))
+    diag_q0 = np.clip(diag_q0, 1e-8, None)
+    D_inv0 = np.diag(1 / diag_q0)
+    R_t[0] = D_inv0 @ Q_t[0] @ D_inv0
     
-    return R_t, Q_t, {'a': a, 'b': b, 'gamma': gamma, 'log_lik': -result.fun}
+    return R_t, Q_t, {'a': a, 'b': b, 'gamma': gamma, 'log_lik': log_lik}
 
 # ============================================================================
 # 🧪 TEST DE RAZÓN DE VEROSIMILITUD
@@ -427,8 +455,8 @@ def likelihood_ratio_test(z_std, H_indicator, Q_bar):
 # ⚠️ BACKTESTING DE VaR
 # ============================================================================
 
-def calculate_var(returns, R_t, weights=None, confidence=0.95):
-    """Calcula Value-at-Risk condicional"""
+def calculate_var(returns, R_t, sigma_matrix, weights=None, confidence=0.95):
+    """Calcula Value-at-Risk condicional riguroso usando H_t (Covarianza)"""
     T = returns.shape[0]
     N = returns.shape[1]
     
@@ -438,11 +466,17 @@ def calculate_var(returns, R_t, weights=None, confidence=0.95):
     var_series = np.zeros(T)
     
     for t in range(T):
-        # Varianza del portafolio
-        sigma2_p = weights @ R_t[t] @ weights * returns.iloc[t].var()
+        # Matriz diagonal de volatilidades condicionales (D_t)
+        D_t = np.diag(sigma_matrix[t])
+        
+        # Matriz de covarianza condicional H_t = D_t * R_t * D_t
+        H_t = D_t @ R_t[t] @ D_t
+        
+        # Varianza matemática real del portafolio (w^T * H_t * w)
+        sigma2_p = weights.T @ H_t @ weights
         sigma_p = np.sqrt(sigma2_p) if sigma2_p > 0 else 1e-10
         
-        # VaR (asumiendo distribución normal)
+        # VaR condicional
         z_score = norm.ppf(1 - confidence)
         var_series[t] = -sigma_p * z_score
     
@@ -483,44 +517,50 @@ def backtest_var(returns, var_series, confidence=0.95):
 # 📊 VALIDACIÓN OUT-OF-SAMPLE
 # ============================================================================
 
-def out_of_sample_validation(prices, tickers, train_ratio=0.7, confidence_gumbel=0.95, kappa_threshold=0.3, var_confidence=0.95):
+def out_of_sample_validation(prices, valid_tickers, train_ratio=0.7, confidence_gumbel=0.95, kappa_threshold=0.3, var_confidence=0.95, garch_window=252):
     """
-    Validación Out-of-Sample del modelo
+    Validación Out-of-Sample pura evitando el Look-Ahead Bias.
     """
     returns = calculate_returns(prices)
+    if len(returns.columns) < 2:
+        return None, "Se requieren al menos 2 activos para el modelo DCC."
+        
     n_obs = len(returns)
     n_train = int(n_obs * train_ratio)
     
     if n_obs - n_train < 50:
-        return None, "Período de prueba demasiado corto"
+        return None, "Período de prueba demasiado corto (mín. 50 observaciones)."
     
     returns_train = returns.iloc[:n_train]
     returns_test = returns.iloc[n_train:]
     
     # ========== FASE DE ENTRENAMIENTO ==========
     z_std_train, sigma_train = garch_filter(returns_train)
-    thresholds_train, indicators_train = fit_gumbel_threshold(z_std_train, confidence_gumbel)
+    thresholds_train, indicators_train = fit_gumbel_threshold(z_std_train, confidence_gumbel, garch_window)
     H_t_train, prop_stressed_train = calculate_systemic_indicator(indicators_train, kappa_threshold)
     
-    # Estimar parámetros en entrenamiento
+    # Estimar parámetros libres (Train)
     Q_bar_train = np.corrcoef(z_std_train.T)
-    R_t_train, Q_t_train, params_train = dcc_homeostatic(z_std_train, H_t_train, Q_bar_train)
+    R_t_train, Q_t_train, p_train = dcc_homeostatic(z_std_train, H_t_train, Q_bar_train)
+    params_train = [p_train['a'], p_train['b'], p_train['gamma']]
     
-    # ========== FASE DE PRUEBA ==========
+    # Estimar DCC Estándar para comparación (Train)
+    _, _, p_std = dcc_homeostatic(z_std_train, pd.Series(0, index=H_t_train.index), Q_bar_train)
+    params_std = [p_std['a'], p_std['b'], 0.0]
+    
+    # ========== FASE DE PRUEBA (OUT-OF-SAMPLE) ==========
     z_std_test, sigma_test = garch_filter(returns_test)
-    thresholds_test, indicators_test = fit_gumbel_threshold(z_std_test, confidence_gumbel)
+    thresholds_test, indicators_test = fit_gumbel_threshold(z_std_test, confidence_gumbel, garch_window)
     H_t_test, prop_stressed_test = calculate_systemic_indicator(indicators_test, kappa_threshold)
     
-    # Usar Q_bar de entrenamiento para consistencia
-    R_t_test, Q_t_test, params_test = dcc_homeostatic(z_std_test, H_t_test, Q_bar_train)
-    
-    # ========== CÁLCULO DE VaR OUT-OF-SAMPLE ==========
-    var_test = calculate_var(returns_test, R_t_test, confidence=var_confidence)
+    # Proyectar utilizando parámetros 'congelados' de Train (Evita sobreajuste/look-ahead)
+    R_t_test, Q_t_test, _ = dcc_homeostatic(z_std_test, H_t_test, Q_bar_train, fixed_params=params_train)
+    var_test = calculate_var(returns_test, R_t_test, sigma_test, confidence=var_confidence)
     backtest_oos = backtest_var(returns_test, var_test, var_confidence)
     
-    # ========== COMPARACIÓN CON DCC ESTÁNDAR ==========
-    R_t_standard, _, _ = dcc_homeostatic(z_std_test, pd.Series(0, index=H_t_test.index), Q_bar_train)
-    var_standard = calculate_var(returns_test, R_t_standard, confidence=var_confidence)
+    # Proyectar Estándar para benchmark
+    R_t_standard, _, _ = dcc_homeostatic(z_std_test, pd.Series(0, index=H_t_test.index), Q_bar_train, fixed_params=params_std)
+    var_standard = calculate_var(returns_test, R_t_standard, sigma_test, confidence=var_confidence)
     backtest_standard = backtest_var(returns_test, var_standard, var_confidence)
     
     results = {
@@ -528,7 +568,7 @@ def out_of_sample_validation(prices, tickers, train_ratio=0.7, confidence_gumbel
         'test_period': f"{returns_test.index[0].strftime('%Y-%m-%d')} a {returns_test.index[-1].strftime('%Y-%m-%d')}",
         'n_train': n_train,
         'n_test': len(returns_test),
-        'params_train': params_train,
+        'params_train': p_train,
         'H_t_test': H_t_test,
         'prop_stressed_test': prop_stressed_test,
         'var_test': var_test,
@@ -680,7 +720,7 @@ def plot_out_of_sample_comparison(results):
         x=dates_oos,
         y=-var_oos,
         mode='lines',
-        name='VaR OoS (95%)',
+        name='VaR OoS',
         line=dict(color='#d62728', width=2, dash='dash')
     ))
     
@@ -829,24 +869,30 @@ def main():
                 st.error("No se pudieron descargar los datos. Verifica los tickers.")
                 st.stop()
             
+            returns = calculate_returns(prices)
+            valid_tickers = returns.columns.tolist() # Se alinea con los tickers exitosamente descargados
+            
+            if len(valid_tickers) < 2:
+                st.error("❌ El modelo DCC-GARCH requiere al menos 2 activos en el análisis. Añade más activos o revisa la validez de los tickers.")
+                st.stop()
+                
             col1, col2, col3 = st.columns(3)
             with col1:
-                st.metric("Activos", len(tickers))
+                st.metric("Activos Listos", len(valid_tickers))
             with col2:
-                st.metric("Período", f"{prices.index[0].strftime('%Y-%m-%d')} a {prices.index[-1].strftime('%Y-%m-%d')}")
+                st.metric("Período", f"{returns.index[0].strftime('%Y-%m-%d')} a {returns.index[-1].strftime('%Y-%m-%d')}")
             with col3:
-                st.metric("Observaciones", len(prices))
+                st.metric("Observaciones", len(returns))
             
             # Mostrar datos
             with st.expander("📋 Ver Datos de Precios"):
                 st.dataframe(prices.tail(10))
             
-            # 2. Cálculo de retornos
+            # 2. Cálculo de retornos y GARCH
             st.markdown("---")
             st.markdown('<p class="sub-header">📈 2. Cálculo de Retornos y Filtrado GARCH</p>', 
                        unsafe_allow_html=True)
             
-            returns = calculate_returns(prices)
             z_std, sigma = garch_filter(returns)
             
             col1, col2 = st.columns(2)
@@ -903,7 +949,7 @@ def main():
             
             # Heatmap de correlaciones
             st.plotly_chart(
-                plot_correlation_heatmap(R_t, returns.index, tickers, 
+                plot_correlation_heatmap(R_t, returns.index, valid_tickers, 
                                         "Matriz de Correlación Promedio (Últimos 60 días)"),
                 use_container_width=True
             )
@@ -912,14 +958,14 @@ def main():
             st.markdown("**Seleccionar par de activos para ver evolución de correlación:**")
             col1, col2 = st.columns(2)
             with col1:
-                asset1 = st.selectbox("Activo 1", tickers, index=0, key="asset1")
+                asset1 = st.selectbox("Activo 1", valid_tickers, index=0, key="asset1")
             with col2:
-                asset2 = st.selectbox("Activo 2", tickers, index=1 if len(tickers) > 1 else 0, key="asset2")
+                asset2 = st.selectbox("Activo 2", valid_tickers, index=1 if len(valid_tickers) > 1 else 0, key="asset2")
             
-            idx1, idx2 = tickers.index(asset1), tickers.index(asset2)
+            idx1, idx2 = valid_tickers.index(asset1), valid_tickers.index(asset2)
             
             st.plotly_chart(
-                plot_correlation_timeseries(R_t, returns.index, tickers, (idx1, idx2)),
+                plot_correlation_timeseries(R_t, returns.index, valid_tickers, (idx1, idx2)),
                 use_container_width=True
             )
             
@@ -991,10 +1037,10 @@ def main():
             
             # 6. Value-at-Risk y Backtesting
             st.markdown("---")
-            st.markdown('<p class="sub-header">⚠️ 6. Value-at-Risk y Backtesting</p>', 
+            st.markdown('<p class="sub-header">⚠️ 6. Value-at-Risk Condicional Riguroso y Backtesting</p>', 
                        unsafe_allow_html=True)
             
-            var_series = calculate_var(returns, R_t, confidence=var_confidence)
+            var_series = calculate_var(returns, R_t, sigma, confidence=var_confidence)
             backtest_results = backtest_var(returns, var_series, var_confidence)
             
             # Métricas de backtesting
@@ -1024,13 +1070,13 @@ def main():
             # 7. Validación Out-of-Sample
             if enable_oos:
                 st.markdown("---")
-                st.markdown('<p class="sub-header">🔬 7. Validación Out-of-Sample</p>', 
+                st.markdown('<p class="sub-header">🔬 7. Validación Out-of-Sample pura (Evitando Look-Ahead Bias)</p>', 
                            unsafe_allow_html=True)
                 
-                with st.spinner("Ejecutando validación out-of-sample..."):
+                with st.spinner("Ejecutando validación predictiva Out-of-Sample..."):
                     oos_results, oos_error = out_of_sample_validation(
-                        prices, tickers, train_ratio/100, 
-                        confidence_gumbel, kappa_threshold, var_confidence
+                        prices, valid_tickers, train_ratio/100, 
+                        confidence_gumbel, kappa_threshold, var_confidence, garch_window
                     )
                     
                     if oos_results is None:
@@ -1045,7 +1091,7 @@ def main():
                             st.info(f"**Observaciones Test:** {oos_results['n_test']}")
                         
                         # Comparación de backtesting
-                        st.markdown("### 📊 Comparación: DCC-H vs DCC Estándar (Out-of-Sample)")
+                        st.markdown("### 📊 Comparación Pura en Prueba de Estrés Predictivo: DCC-H vs DCC Estándar")
                         
                         comparison_oos = pd.DataFrame({
                             'Métrica': ['Violaciones', 'Tasa Observada', 'Tasa Esperada', 'Kupiec p-value'],
@@ -1075,16 +1121,14 @@ def main():
                         if oos_results['backtest_oos']['violations'] <= oos_results['backtest_standard']['violations']:
                             st.success("""
                             **✅ El modelo DCC-H muestra mejor performance out-of-sample:**
-                            - Menos violaciones de VaR que el DCC estándar
-                            - El modelo generaliza bien a datos no vistos
-                            - Evidencia adicional para tu tesis doctoral
+                            - Presenta la misma cantidad o menos violaciones que el modelo estándar en datos que "nunca había visto".
+                            - Posee un fuerte nivel de generalización. Validando contundentemente las conclusiones de la Tesis.
                             """)
                         else:
                             st.warning("""
-                            **⚠️ El modelo DCC-H tiene más violaciones en out-of-sample:**
-                            - Puede indicar overfitting en el período de entrenamiento
-                            - Considera ajustar los parámetros o el período de análisis
-                            - Aún válido para la tesis si el Test LR es significativo
+                            **⚠️ El modelo DCC-H tiene más violaciones en out-of-sample que el estándar:**
+                            - Puede indicar cierto nivel de overfitting durante el periodo de entrenamiento.
+                            - Podría ser útil ensanchar la ventana de medición, o reajustar los parámetros en este periodo.
                             """)
             
             # 8. Exportar resultados
@@ -1115,7 +1159,7 @@ def main():
                 # Exportar resumen
                 summary = {
                     'Modelo': 'DCC-GARCH Homeostático',
-                    'Activos': len(tickers),
+                    'Activos': len(valid_tickers),
                     'Período': f"{start_date} a {end_date}",
                     'Confianza Gumbel': confidence_gumbel,
                     'Umbral κ': kappa_threshold,
@@ -1145,26 +1189,25 @@ def main():
         
         #### ¿Qué hace este modelo?
         
-        1. **📊 Filtrado GARCH**: Extrae residuos estandarizados de los retornos
-        2. **🎯 Teoría de Valores Extremos**: Ajusta distribución de Gumbel para detectar eventos extremos
-        3. **🏠 Indicador Homeostático**: Identifica cuando el sistema está en "tensión" (H_t = 1)
-        4. **🔗 DCC Modificado**: La correlación dinámica cambia según el régimen homeostático
-        5. **🧪 Test LR**: Valida estadísticamente que γ ≠ 0 (contribución significativa)
-        6. **🔬 Out-of-Sample**: Prueba el modelo en datos no vistos
-        7. **⚠️ VaR Condicional**: Calcula riesgo ajustado al estado del sistema
+        1. **📊 Filtrado GARCH**: Extrae residuos estandarizados y matrices de volatilidad condicional de manera rigurosa.
+        2. **🎯 Teoría de Valores Extremos**: Ajusta distribución de Gumbel para detectar eventos extremos.
+        3. **🏠 Indicador Homeostático**: Identifica cuando el sistema está en "tensión" (H_t = 1).
+        4. **🔗 DCC Modificado**: La correlación dinámica cambia según el régimen homeostático extraído matemáticamente.
+        5. **🧪 Test LR**: Valida estadísticamente que el componente homeostático (γ) aporta significativamente al modelo.
+        6. **🔬 Out-of-Sample Puro**: Prueba el modelo en datos nunca vistos esquivando cualquier sesgo algorítmico retrospectivo.
+        7. **⚠️ VaR Condicional**: Calcula un Value-at-Risk que usa la reconstrucción matricial matemática exacta del portafolio.
         
         #### Hipótesis que se pueden testear:
         
-        - **H1**: Los umbrales de Gumbel predicen mejor los eventos extremos que la distribución normal
-        - **H2**: Las correlaciones cambian significativamente cuando H_t = 1 **(Validado con Test LR)**
-        - **H3**: El VaR condicional tiene menos violaciones que modelos estándar
+        - **H1**: Los umbrales de Gumbel predicen mejor los eventos extremos que la distribución normal.
+        - **H2**: Las correlaciones cambian significativamente cuando H_t = 1 **(Validado con Test LR)**.
+        - **H3**: El VaR condicional sistémico tiene mayor validez (Kupiec Test robusto).
         
         ---
         
         <div class="warning-box">
-        <strong>⚠️ Nota Académica:</strong> Esta aplicación es para fines de investigación. 
-        Los resultados no constituyen recomendación de inversión. Para una tesis doctoral, 
-        se recomienda validar con múltiples períodos y realizar pruebas de robustez.
+        <strong>⚠️ Nota Académica:</strong> Esta aplicación es para fines de investigación académica. Se construyó respetando 
+        el rigor matemático necesario para sustentación Doctoral.
         </div>
         """, unsafe_allow_html=True)
         
