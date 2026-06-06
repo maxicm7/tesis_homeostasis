@@ -915,6 +915,54 @@ def plot_out_of_sample_comparison(results):
     
     return fig
 
+def plot_tension_financiera(H_t, dates):
+    """
+    Calcula y grafica los días acumulados sin un evento sistémico (Latencia).
+    Es el equivalente financiero a la brecha entre números primos.
+    """
+    # Calcular días desde el último H_t = 1
+    # Si H_t es 1, se resetea a 0. Si es 0, suma 1 al día anterior.
+    tension_acumulada = H_t.groupby((H_t == 1).cumsum()).cumcount()
+    
+    fig = go.Figure()
+    
+    # Área de acumulación de tensión
+    fig.add_trace(go.Scatter(
+        x=dates, 
+        y=tension_acumulada,
+        mode='lines', 
+        name='Tensión Acumulada (Días)',
+        fill='tozeroy',
+        line=dict(color='#ff4b4b', width=2)
+    ))
+    
+    # Marcar los días de reseteo (H_t = 1)
+    reseteos = dates[H_t == 1]
+    fig.add_trace(go.Scatter(
+        x=reseteos, 
+        y=[0]*len(reseteos),
+        mode='markers', 
+        name='Reseteo Homeostático (H_t=1)',
+        marker=dict(color='#00d4ff', size=8, line=dict(width=1, color='white'))
+    ))
+    
+    fig.update_layout(
+        title="📈 Curva de Presión del Mercado (Equivalente a Brechas de Primos)",
+        xaxis_title="Fecha",
+        yaxis_title="Días sin Crisis Sistémica (Latencia)",
+        height=400,
+        plot_bgcolor="rgba(0,0,0,0)"
+    )
+    
+    return fig
+
+
+
+
+
+
+
+
 # ============================================================================
 # 🖥️ INTERFAZ STREAMLIT PRINCIPAL
 # ============================================================================
