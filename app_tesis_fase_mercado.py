@@ -1814,16 +1814,20 @@ def main():
 
             colr1, colr2 = st.columns(2)
             with colr1:
+                alpha_options = sorted(set([0.90, 0.95, 0.97, 0.98, 0.99, round(float(confidence_gumbel), 3)]))
+                alpha_default = sorted(set([round(float(confidence_gumbel), 3), 0.95, 0.99]) & set(alpha_options))
                 alpha_grid_sel = st.multiselect(
                     "Valores de α (Gumbel) a evaluar",
-                    [0.90, 0.95, 0.97, 0.98, 0.99],
-                    default=sorted(set([confidence_gumbel, 0.95, 0.99]))
+                    alpha_options,
+                    default=alpha_default
                 )
             with colr2:
+                kappa_options = sorted(set([0.30, 0.45, 0.60, round(float(kappa_threshold), 3)]))
+                kappa_default = sorted(set([round(float(kappa_threshold), 3), 0.30, 0.45]) & set(kappa_options))
                 kappa_grid_sel = st.multiselect(
                     "Valores de κ (umbral sistémico) a evaluar",
-                    [0.30, 0.45, 0.60],
-                    default=sorted(set([kappa_threshold, 0.30, 0.45]))
+                    kappa_options,
+                    default=kappa_default
                 )
 
             run_robustness = st.button("▶️ Ejecutar panel de robustez", key="run_robustness_btn")
