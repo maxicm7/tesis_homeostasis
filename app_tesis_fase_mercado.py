@@ -272,47 +272,237 @@ def calculate_returns(prices):
     return returns
 
 # ============================================================================
-# 📈 MODELO GARCH UNIVARIADO
+# 📈 MODELO GARCH UNIVARIADO — ESTIMADO POR MLE, POR ACTIVO (Sección 3.2.3)
 # ============================================================================
+#
+# CORRECCIÓN (punto 4 de la adenda doctoral): los parámetros (omega, alpha,
+# beta) ya NO se fijan igual para todos los activos. Se estiman individualmente
+# por Máxima Verosimilitud (QMLE) para cada serie, con diagnósticos de
+# Ljung-Box y ARCH-LM post-estimación. Fijar los mismos parámetros para
+# activos tan distintos como equity, bonos, oro o divisas sesgaría los
+# residuos estandarizados z_{i,t} que alimentan Gumbel y el DCC-H.
+# ============================================================================
+
+def _garch11_neg_loglik(theta, r):
+    """Log-verosimilitud gaussiana negativa de un GARCH(1,1) univariado."""
+    omega, alpha, beta = theta
+    n = len(r)
+    sigma2 = np.empty(n)
+    sigma2[0] = np.var(r) if np.var(r) > 1e-12 else 1e-6
+    for t in range(1, n):
+        sigma2[t] = omega + alpha * r[t-1] ** 2 + beta * sigma2[t-1]
+    sigma2 = np.clip(sigma2, 1e-12, None)
+    ll = -0.5 * np.sum(np.log(2 * np.pi) + np.log(sigma2) + r ** 2 / sigma2)
+    if not np.isfinite(ll):
+        return 1e10
+    return -ll
+
+
+def fit_garch11_mle(r):
+    """
+    Estima GARCH(1,1) por QMLE para una serie de retornos individual.
+    Escala los retornos (x100) para evitar mal condicionamiento numérico
+    con omega muy pequeño, y usa multi-start para evitar óptimos locales
+    degenerados (alpha->1, beta->0), un problema frecuente en GARCH con
+    optimización de un solo punto de partida.
+    """
+    r = np.asarray(r, dtype=float)
+    r = r[~np.isnan(r)]
+    scale = 100.0
+    rs = r * scale
+
+    bounds = [(1e-8, None), (1e-6, 0.999), (1e-6, 0.999)]
+    cons = ({'type': 'ineq', 'fun': lambda th: 0.999 - (th[1] + th[2])},)
+    var_rs = np.var(rs) if np.var(rs) > 1e-8 else 1.0
+
+    starts = [
+        (var_rs * 0.05, 0.05, 0.90),
+        (var_rs * 0.10, 0.10, 0.85),
+        (var_rs * 0.05, 0.02, 0.95),
+        (var_rs * 0.20, 0.15, 0.75),
+    ]
+
+    best_res = None
+    for s0 in starts:
+        try:
+            res = minimize(_garch11_neg_loglik, x0=np.array(s0), args=(rs,),
+                            method='SLSQP', bounds=bounds, constraints=cons,
+                            options={'maxiter': 1000, 'ftol': 1e-12})
+        except Exception:
+            continue
+        if res is None or not np.isfinite(res.fun):
+            continue
+        if best_res is None or (res.success and not best_res.success) or \
+           (res.success == best_res.success and res.fun < best_res.fun):
+            best_res = res
+
+    if best_res is None:
+        # Fallback conservador si ningún arranque converge
+        omega, alpha, beta = 0.05 * var_rs, 0.08, 0.85
+        converged = False
+        loglik = np.nan
+    else:
+        omega, alpha, beta = best_res.x
+        omega = omega / (scale ** 2)  # des-escalar
+        converged = bool(best_res.success)
+        loglik = -best_res.fun
+
+    n = len(r)
+    sigma2 = np.empty(n)
+    sigma2[0] = np.var(r) if np.var(r) > 1e-12 else 1e-6
+    for t in range(1, n):
+        sigma2[t] = omega + alpha * r[t-1] ** 2 + beta * sigma2[t-1]
+    sigma = np.sqrt(np.clip(sigma2, 1e-12, None))
+    z = r / sigma
+
+    return {
+        'omega': float(omega), 'alpha': float(alpha), 'beta': float(beta),
+        'persistence': float(alpha + beta),
+        'sigma2': sigma2, 'sigma': sigma, 'z': z,
+        'loglik': loglik, 'converged': converged,
+        'sigma2_last': float(sigma2[-1]), 'resid_last': float(r[-1]),
+    }
+
+
+def ljung_box_test(x, lags=10):
+    """Test de Ljung-Box (manual, sin dependencias externas) sobre una serie."""
+    x = np.asarray(x, dtype=float)
+    x = x[~np.isnan(x)]
+    n = len(x)
+    if n <= lags + 1:
+        return {'stat': np.nan, 'p_value': np.nan}
+    x = x - np.mean(x)
+    denom = np.sum(x ** 2)
+    if denom < 1e-12:
+        return {'stat': np.nan, 'p_value': np.nan}
+    stat = 0.0
+    for k in range(1, lags + 1):
+        rk = np.sum(x[k:] * x[:-k]) / denom
+        stat += (rk ** 2) / (n - k)
+    stat *= n * (n + 2)
+    p_value = 1 - chi2.cdf(stat, lags)
+    return {'stat': float(stat), 'p_value': float(p_value)}
+
+
+def arch_lm_test(x, lags=5):
+    """
+    Test ARCH-LM (manual): regresión de x_t^2 sobre sus 'lags' rezagos.
+    Estadístico = n * R^2 ~ chi2(lags) bajo H0 (sin efectos ARCH residuales).
+    """
+    x = np.asarray(x, dtype=float)
+    x = x[~np.isnan(x)]
+    x2 = x ** 2
+    n = len(x2)
+    if n <= lags + 5:
+        return {'stat': np.nan, 'p_value': np.nan}
+    Y = x2[lags:]
+    X = np.column_stack([x2[lags - k: n - k] for k in range(1, lags + 1)])
+    X = np.column_stack([np.ones(len(Y)), X])
+    try:
+        beta_hat, *_ = np.linalg.lstsq(X, Y, rcond=None)
+        Y_hat = X @ beta_hat
+        ss_res = np.sum((Y - Y_hat) ** 2)
+        ss_tot = np.sum((Y - np.mean(Y)) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 1e-12 else 0.0
+        stat = len(Y) * r2
+        p_value = 1 - chi2.cdf(stat, lags)
+        return {'stat': float(stat), 'p_value': float(p_value)}
+    except Exception:
+        return {'stat': np.nan, 'p_value': np.nan}
+
 
 def garch_filter(returns):
     """
-    Filtrado GARCH(1,1) para residuos estandarizados y volatilidades (D_t)
+    Filtrado GARCH(1,1) con parámetros (omega_i, alpha_i, beta_i) estimados
+    por MLE de forma individual para cada activo (Sección 3.2.3).
+
+    Retorna:
+    - z_std: DataFrame (T x N) de residuos estandarizados
+    - sigma_matrix: array (T x N) de volatilidades condicionales
+    - garch_params_df: DataFrame con parámetros y diagnósticos por activo
+    - garch_state: dict {ticker: {'sigma2_last':..., 'resid_last':..., params...}}
+      para continuar el filtro sin re-estimar (usado en validación Out-of-Sample)
     """
     if isinstance(returns, pd.Series):
         returns = returns.to_frame()
-    
+
     n = len(returns)
     N = len(returns.columns)
-    
-    # Calcular varianza incondicional (promedio)
-    total_var = float(returns.var().mean())
-    if total_var < 1e-10:
-        total_var = 1e-6
-    
+
     sigma_matrix = np.zeros((n, N))
     z_std_list = []
-    
-    omega, alpha, beta = 0.00001, 0.1, 0.85
-    
-    for i in range(N):
-        sigma2_col = np.full(n, total_var)
-        
-        # Filtro iterativo GARCH(1,1)
-        for t in range(1, n):
-            val = returns.iloc[t-1, i]
-            sigma2_col[t] = omega + alpha * val**2 + beta * sigma2_col[t-1]
-        
-        sigma_col = np.sqrt(sigma2_col)
-        sigma_col[sigma_col < 1e-10] = 1e-10
-        sigma_matrix[:, i] = sigma_col
-        
-        # Residuos Estandarizados
-        z_col = returns.iloc[:, i] / sigma_col
-        z_std_list.append(z_col.values)
-    
+    rows = []
+    garch_state = {}
+
+    for i, col in enumerate(returns.columns):
+        r = returns[col].values
+        fit = fit_garch11_mle(r)
+
+        sigma_matrix[:, i] = fit['sigma']
+        z_std_list.append(fit['z'])
+
+        lb = ljung_box_test(fit['z'], lags=10)
+        lb2 = ljung_box_test(fit['z'] ** 2, lags=10)
+        lm = arch_lm_test(fit['z'], lags=5)
+
+        rows.append({
+            'Ticker': col,
+            'omega': fit['omega'], 'alpha': fit['alpha'], 'beta': fit['beta'],
+            'persistencia (a+b)': fit['persistence'],
+            'Convergió': fit['converged'],
+            'Ljung-Box p (z)': lb['p_value'],
+            'Ljung-Box p (z²)': lb2['p_value'],
+            'ARCH-LM p': lm['p_value'],
+        })
+
+        garch_state[col] = {
+            'omega': fit['omega'], 'alpha': fit['alpha'], 'beta': fit['beta'],
+            'sigma2_last': fit['sigma2_last'], 'resid_last': fit['resid_last'],
+        }
+
     z_std = pd.DataFrame(np.column_stack(z_std_list), index=returns.index, columns=returns.columns)
-    
+    garch_params_df = pd.DataFrame(rows)
+
+    return z_std, sigma_matrix, garch_params_df, garch_state
+
+
+def garch_filter_apply_fixed(returns, garch_state):
+    """
+    Aplica parámetros GARCH(1,1) YA ESTIMADOS (congelados) a un nuevo tramo
+    de retornos, continuando la recursión de sigma² desde el último estado
+    conocido (sigma2_last, resid_last), sin reestimar y sin reinicializar
+    con la varianza incondicional del propio tramo nuevo.
+
+    Esto es lo que corresponde usar durante la proyección Out-of-Sample:
+    los parámetros y el estado se "congelan" en el momento de entrenamiento
+    y se propagan hacia adelante, como ocurriría en un despliegue real.
+    """
+    if isinstance(returns, pd.Series):
+        returns = returns.to_frame()
+
+    n = len(returns)
+    N = len(returns.columns)
+    sigma_matrix = np.zeros((n, N))
+    z_std_list = []
+
+    for i, col in enumerate(returns.columns):
+        st_i = garch_state[col]
+        omega, alpha, beta = st_i['omega'], st_i['alpha'], st_i['beta']
+        r = returns[col].values
+
+        sigma2 = np.empty(n)
+        sigma2_prev = st_i['sigma2_last']
+        resid_prev = st_i['resid_last']
+        for t in range(n):
+            sigma2[t] = omega + alpha * resid_prev ** 2 + beta * sigma2_prev
+            sigma2_prev = sigma2[t]
+            resid_prev = r[t]
+
+        sigma = np.sqrt(np.clip(sigma2, 1e-12, None))
+        sigma_matrix[:, i] = sigma
+        z_std_list.append(r / sigma)
+
+    z_std = pd.DataFrame(np.column_stack(z_std_list), index=returns.index, columns=returns.columns)
     return z_std, sigma_matrix
 
 # ============================================================================
@@ -321,43 +511,53 @@ def garch_filter(returns):
 
 def fit_gumbel_threshold(residuals, confidence=0.95, window=252):
     """
-    Ajusta distribución de Gumbel y calcula umbrales de tensión homeostática
+    Ajusta distribución de Gumbel y calcula umbrales de tensión homeostática.
+
+    CORRECCIÓN (punto 2 / anti-look-ahead): el umbral ya NO es un valor único
+    promediado sobre TODAS las ventanas de la muestra (lo cual usaba
+    implícitamente información futura para clasificar días pasados). Ahora
+    el umbral τ_t es estrictamente causal y variable en el tiempo: en cada t
+    se ajusta Gumbel únicamente con la ventana [t-window, t-1], y h_{i,t} se
+    evalúa contra ESE umbral específico de t (Sección 3.3.2 de la tesis).
+    Los primeros `window` días no tienen umbral definido (burn-in) y quedan
+    con indicador 0 por defecto.
+
+    Retorna:
+    - thresholds_summary: dict {ticker: umbral promedio en el tiempo} — solo
+      para fines de visualización resumida en la interfaz.
+    - indicators: DataFrame (T x N) binario, causal.
+    - threshold_ts: DataFrame (T x N) con el umbral τ_t completo, variable en
+      el tiempo (NaN durante el burn-in).
     """
-    thresholds = {}
-    indicators = pd.DataFrame(index=residuals.index)
-    
+    indicators = pd.DataFrame(0, index=residuals.index, columns=residuals.columns)
+    threshold_ts = pd.DataFrame(np.nan, index=residuals.index, columns=residuals.columns)
+    thresholds_summary = {}
+
     for col in residuals.columns:
-        locs = []
-        scales = []
-        
-        for t in range(window, len(residuals)):
-            window_data = np.abs(residuals[col].iloc[t-window:t]).dropna()
-            if len(window_data) < 10:
+        abs_res = np.abs(residuals[col]).values
+        n = len(abs_res)
+        thresh_col = np.full(n, np.nan)
+
+        for t in range(window, n):
+            window_data = abs_res[t - window:t]
+            window_data = window_data[~np.isnan(window_data)]
+            if len(window_data) < 30:
                 continue
-            
             try:
                 loc, scale = gumbel_r.fit(window_data)
-                locs.append(loc)
-                scales.append(scale)
-            except:
+                thresh_col[t] = gumbel_r.ppf(confidence, loc=loc, scale=scale)
+            except Exception:
                 continue
-        
-        if locs:
-            avg_loc = np.mean(locs)
-            avg_scale = np.mean(scales)
-        else:
-            try:
-                clean_data = np.abs(residuals[col]).dropna()
-                avg_loc, avg_scale = gumbel_r.fit(clean_data)
-            except:
-                avg_loc, avg_scale = 0, 1
-        
-        threshold = gumbel_r.ppf(confidence, loc=avg_loc, scale=avg_scale)
-        thresholds[col] = threshold
-        
-        indicators[col] = ((np.abs(residuals[col]) > threshold).astype(int)).fillna(0).astype(int)
-    
-    return thresholds, indicators
+
+        valid = ~np.isnan(thresh_col)
+        ind_col = np.zeros(n, dtype=int)
+        ind_col[valid] = (abs_res[valid] > thresh_col[valid]).astype(int)
+
+        indicators[col] = ind_col
+        threshold_ts[col] = thresh_col
+        thresholds_summary[col] = float(np.nanmean(thresh_col)) if valid.any() else np.nan
+
+    return thresholds_summary, indicators, threshold_ts
 
 def calculate_systemic_indicator(indicators, kappa=0.3):
     """
@@ -382,88 +582,151 @@ def ensure_positive_definite(matrix, min_eig=1e-6):
     new_eigvals = np.maximum(eigvals, min_eig)
     return eigvecs @ np.diag(new_eigvals) @ eigvecs.T
 
-def dcc_likelihood_full(z_std, H_indicator, Q_bar, params):
+
+def compute_recursive_Qstress(z_std, H_indicator, Q_bar, min_obs=30, shrink_c=20.0):
     """
-    Calcula la log-verosimilitud completa del modelo DCC
+    CORRECCIÓN (punto 2 — anti-circularidad, Sección 3.4.5 de la tesis):
+    Q^(S) ya NO se estima una única vez con TODA la muestra (lo cual usaba
+    información contemporánea y futura respecto de cada t para construir el
+    objetivo hacia el cual el propio parámetro gamma empuja — un artefacto
+    de sobreajuste in-sample). Ahora Q^(S)_t se estima de forma RECURSIVA,
+    usando únicamente observaciones con H_s=1 para s <= t-2 (estrictamente
+    pasado respecto del período que se está actualizando).
+
+    Si no hay al menos `min_obs` observaciones de estrés disponibles hasta
+    ese punto (período de calentamiento / burn-in), Q^(S)_t colapsa a Q_bar,
+    con lo cual el término gamma se anula automáticamente y el modelo se
+    comporta como un DCC estándar hasta acumular evidencia suficiente.
+
+    Se aplica además una contracción (shrinkage, en el espíritu de
+    Ledoit-Wolf) hacia Q_bar, con peso decreciente a medida que crece el
+    número de observaciones de estrés disponibles — mitiga el problema de
+    dimensionalidad cuando N es grande respecto de los días de estrés.
+
+    Retorna: array (T, N, N) — Q^(S)_t a usar en la actualización de Q_t.
+    """
+    Z = z_std.values if hasattr(z_std, 'values') else np.asarray(z_std)
+    H = H_indicator.values if hasattr(H_indicator, 'values') else np.asarray(H_indicator)
+    T, N = Z.shape
+
+    cum_outer = np.zeros((N, N))
+    cum_count = 0
+    cum_outer_hist = [None] * T
+    cum_count_hist = [0] * T
+
+    for s in range(T):
+        if H[s] == 1:
+            zs = Z[s]
+            cum_outer = cum_outer + np.outer(zs, zs)
+            cum_count += 1
+        cum_outer_hist[s] = cum_outer
+        cum_count_hist[s] = cum_count
+
+    Qs = np.zeros((T, N, N))
+    for t in range(T):
+        idx = t - 2  # información disponible estrictamente hasta s = t-2
+        if idx < 0 or cum_count_hist[idx] < min_obs:
+            Qs[t] = Q_bar
+            continue
+        n_obs = cum_count_hist[idx]
+        avg_outer = cum_outer_hist[idx] / n_obs
+        d = np.sqrt(np.clip(np.diag(avg_outer), 1e-8, None))
+        corr = avg_outer / np.outer(d, d)
+        corr = ensure_positive_definite(corr, min_eig=1e-6)
+        delta = min(1.0, shrink_c / (n_obs + shrink_c))
+        Qs[t] = (1 - delta) * corr + delta * Q_bar
+
+    return Qs
+
+
+def dcc_likelihood_full(z_std, H_indicator, Q_bar, params, Qs_precomputed,
+                          return_contributions=False):
+    """
+    Calcula la log-verosimilitud completa del modelo DCC, usando Q^(S)_t
+    RECURSIVO (Qs_precomputed[t], ver compute_recursive_Qstress) en lugar de
+    una única matriz de estrés estática calculada con toda la muestra.
     """
     T = len(z_std)
     N = z_std.shape[1]
-    
+
     a = max(params[0], 1e-8)
     b = max(params[1], 1e-8)
     gamma = max(params[2], 1e-8) if len(params) > 2 else 0.0
-    
+
     # Restricciones para estabilidad
     if a + b + gamma >= 0.98 or a > 0.5 or b > 0.95:
-        return -1000.0
-    
-    # Matriz de estrés
-    stress_periods = z_std[H_indicator == 1]
-    if len(stress_periods) > 10:
-        Q_stress = np.corrcoef(stress_periods.T)
-    else:
-        Q_stress = Q_bar.copy()
-    
-    Q_stress = ensure_positive_definite(Q_stress, min_eig=1e-4)
+        return (-1000.0, None) if return_contributions else -1000.0
+
+    Z = z_std.values if hasattr(z_std, 'values') else np.asarray(z_std)
+    H = H_indicator.values if hasattr(H_indicator, 'values') else np.asarray(H_indicator)
+
     Q_prev = ensure_positive_definite(Q_bar.copy(), min_eig=1e-4)
-    
+
     log_lik = 0.0
     count_valid = 0
-    
+    contributions = np.zeros(T) if return_contributions else None
+
     for t in range(1, T):
         try:
-            if gamma > 0 and H_indicator.iloc[t-1] == 1:
+            Q_stress_t = Qs_precomputed[t]
+            if gamma > 0 and H[t-1] == 1:
                 Q_t = (1 - a - b - gamma) * Q_bar + \
-                      a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
+                      a * np.outer(Z[t-1], Z[t-1]) + \
                       b * Q_prev + \
-                      gamma * Q_stress
+                      gamma * Q_stress_t
             else:
                 Q_t = (1 - a - b) * Q_bar + \
-                      a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
+                      a * np.outer(Z[t-1], Z[t-1]) + \
                       b * Q_prev
-            
+
             # Normalizar a correlación
             diag_q = np.sqrt(np.diag(Q_t))
             diag_q = np.clip(diag_q, 1e-8, None)
             D_inv = np.diag(1 / diag_q)
             R_t = D_inv @ Q_t @ D_inv
-            
+
             # Validar definida-positividad
             min_eig_R = np.min(np.linalg.eigvalsh(R_t))
             if min_eig_R < 1e-4:
                 R_t = R_t + (1e-4 - min_eig_R) * np.eye(N)
-            
+
             # Contribución a log-verosimilitud
             sign, logdet = np.linalg.slogdet(R_t)
             if sign <= 0 or np.isnan(logdet):
                 continue
-                
-            z_vec = z_std.iloc[t-1].values
+
+            z_vec = Z[t-1]
             R_inv = np.linalg.inv(R_t)
             quadratic = float(z_vec.T @ R_inv @ z_vec)
-            
+
             if np.isnan(quadratic) or quadratic > 1000:
                 continue
-                
+
             contribution = -0.5 * (logdet + quadratic)
             log_lik += contribution
+            if return_contributions:
+                contributions[t] = contribution
             count_valid += 1
             Q_prev = R_t
-            
-        except Exception as e:
+
+        except Exception:
             continue
-    
+
     if count_valid < T * 0.8:
-        return -10000.0 - (T * count_valid)
-    
+        bad = -10000.0 - (T * count_valid)
+        return (bad, contributions) if return_contributions else bad
+
+    if return_contributions:
+        return float(log_lik), contributions
     return float(log_lik)
 
-def estimate_dcc_parameters(z_std, H_indicator, Q_bar, model_type='DCC-H'):
+
+def estimate_dcc_parameters(z_std, H_indicator, Q_bar, Qs_precomputed, model_type='DCC-H'):
     """
-    Estima parámetros DCC por máxima verosimilitud
+    Estima parámetros DCC por máxima verosimilitud, usando Q^(S)_t recursivo.
     """
     def neg_log_lik(params):
-        result = dcc_likelihood_full(z_std, H_indicator, Q_bar, params)
+        result = dcc_likelihood_full(z_std, H_indicator, Q_bar, params, Qs_precomputed)
         if np.isinf(result) or np.isnan(result):
             return 1e10
         return -result
@@ -485,10 +748,57 @@ def estimate_dcc_parameters(z_std, H_indicator, Q_bar, model_type='DCC-H'):
     
     return result
 
-def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None):
+
+def compute_opg_se(z_std, H_indicator, Q_bar, Qs_precomputed, params, h=1e-4):
     """
-    Implementación del DCC-GARCH Homeostático.
-    Permite fijar los parámetros para validaciones Out-of-Sample genuinas.
+    Errores estándar robustos tipo "sandwich" (OPG — outer product of
+    gradients, en el espíritu de Bollerslev & Wooldridge, 1992) para los
+    parámetros de la Etapa 2 (a, b, gamma). Aproxima la matriz de
+    información mediante la suma de productos externos de las
+    contribuciones de score por observación (derivadas numéricas de la
+    log-verosimilitud por t respecto de cada parámetro).
+
+    Nota de honestidad metodológica (ver Sección 3.5.3 de la tesis): esta
+    aproximación corrige la sub-estimación de SE que resulta de ignorar por
+    completo la incertidumbre de estimación (como hacía la versión anterior
+    de esta app, que no reportaba SE en absoluto), pero NO propaga la
+    incertidumbre de la Etapa 1 (parámetros GARCH). Para inferencia
+    doctoral completa se recomienda complementar con el bootstrap
+    paramétrico descrito en la Sección 3.9 de la tesis.
+    """
+    k = len(params)
+    params = np.array(params, dtype=float)
+    T = len(z_std)
+    scores = np.zeros((T, k))
+
+    for j in range(k):
+        p_plus = params.copy(); p_plus[j] += h
+        p_minus = params.copy(); p_minus[j] -= h
+        _, c_plus = dcc_likelihood_full(z_std, H_indicator, Q_bar, p_plus, Qs_precomputed,
+                                          return_contributions=True)
+        _, c_minus = dcc_likelihood_full(z_std, H_indicator, Q_bar, p_minus, Qs_precomputed,
+                                           return_contributions=True)
+        if c_plus is None or c_minus is None:
+            scores[:, j] = 0.0
+            continue
+        scores[:, j] = (c_plus - c_minus) / (2 * h)
+
+    B = scores.T @ scores
+    try:
+        cov = np.linalg.pinv(B)
+        se = np.sqrt(np.clip(np.diag(cov), 0, None))
+    except Exception:
+        se = np.full(k, np.nan)
+    return se
+
+
+def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None, Qs_precomputed=None):
+    """
+    Implementación del DCC-GARCH Homeostático, con Q^(S)_t recursivo
+    (anti-circularidad). Permite fijar los parámetros para validaciones
+    Out-of-Sample genuinas, y opcionalmente recibir un Qs_precomputed ya
+    calculado (por ejemplo, sobre la serie combinada train+test) para
+    garantizar continuidad causal entre entrenamiento y prueba.
     """
     if z_std is None or z_std.empty:
         raise ValueError("z_std no puede ser nulo o vacío")
@@ -500,10 +810,13 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None):
         Q_bar = np.corrcoef(z_std.T)
     
     Q_bar = ensure_positive_definite(Q_bar, min_eig=1e-6)
-    
+
+    if Qs_precomputed is None:
+        Qs_precomputed = compute_recursive_Qstress(z_std, H_indicator, Q_bar)
+
     # Estimar parámetros o usar fijos
     if fixed_params is None:
-        result = estimate_dcc_parameters(z_std, H_indicator, Q_bar, 'DCC-H')
+        result = estimate_dcc_parameters(z_std, H_indicator, Q_bar, Qs_precomputed, 'DCC-H')
         params = result.x
         log_lik = -result.fun
     else:
@@ -513,12 +826,10 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None):
     a = float(np.clip(params[0], 1e-8, 0.3))
     b = float(np.clip(params[1], 0.5, 0.95))
     gamma = float(np.clip(params[2] if len(params) > 2 else 0.0, 0, 0.3))
-    
-    # Matriz de estrés
-    stress_periods = z_std[H_indicator == 1]
-    Q_stress = np.corrcoef(stress_periods.T) if len(stress_periods) > 10 else Q_bar.copy()
-    Q_stress = ensure_positive_definite(Q_stress, min_eig=1e-6)
-    
+
+    Z = z_std.values if hasattr(z_std, 'values') else np.asarray(z_std)
+    H = H_indicator.values if hasattr(H_indicator, 'values') else np.asarray(H_indicator)
+
     # Evolución de Q_t
     Q_t = np.zeros((T, N, N))
     R_t = np.zeros((T, N, N))
@@ -526,14 +837,15 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None):
     
     for t in range(1, T):
         try:
-            if gamma > 0 and H_indicator.iloc[t-1] == 1:
+            Q_stress_t = Qs_precomputed[t]
+            if gamma > 0 and H[t-1] == 1:
                 Q_t[t] = (1 - a - b - gamma) * Q_bar + \
-                         a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
+                         a * np.outer(Z[t-1], Z[t-1]) + \
                          b * Q_t[t-1] + \
-                         gamma * Q_stress
+                         gamma * Q_stress_t
             else:
                 Q_t[t] = (1 - a - b) * Q_bar + \
-                         a * np.outer(z_std.iloc[t-1], z_std.iloc[t-1]) + \
+                         a * np.outer(Z[t-1], Z[t-1]) + \
                          b * Q_t[t-1]
             
             Q_t[t] = ensure_positive_definite(Q_t[t], min_eig=1e-8)
@@ -547,7 +859,7 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None):
             if min_eig < 1e-5:
                 R_t[t] = R_t[t] + (1e-5 - min_eig) * np.eye(N)
                 
-        except Exception as e:
+        except Exception:
             Q_t[t] = Q_t[t-1] if t > 0 else Q_bar
             R_t[t] = R_t[t-1] if t > 0 else Q_bar
     
@@ -557,23 +869,45 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None):
     D_inv0 = np.diag(1 / diag_q0)
     R_t[0] = D_inv0 @ Q_t[0] @ D_inv0
     
-    return R_t, Q_t, {'a': a, 'b': b, 'gamma': gamma, 'log_lik': log_lik}
+    return R_t, Q_t, {'a': a, 'b': b, 'gamma': gamma, 'log_lik': log_lik,
+                       'Qs_precomputed': Qs_precomputed}
 
 # ============================================================================
 # 🧪 TEST DE RAZÓN DE VEROSIMILITUD
 # ============================================================================
 
-def likelihood_ratio_test(z_std, H_indicator, Q_bar):
+def likelihood_ratio_test(z_std, H_indicator, Q_bar, Qs_precomputed=None, compute_se=True):
     """
-    Test de Razón de Verosimilitud: DCC-H vs DCC estándar
+    Test de Razón de Verosimilitud: DCC-H vs DCC estándar.
+
+    CORRECCIÓN (punto 3 — Sección 3.6.1 de la tesis): dado que gamma>=0 es
+    una restricción de FRONTERA (el modelo exige gamma>=0 por construcción
+    económica), bajo H0: gamma=0 el estadístico LR NO sigue una chi2(1)
+    estándar. Sigue una mezcla 50/50 entre una masa puntual en 0 y una
+    chi2(1) (Self & Liang, 1987; Chernoff, 1954), de modo que:
+
+        p_value_corregido = 0.5 * P(chi2(1) > LR_observado)
+
+    Usar la chi2(1) sin corregir SUBESTIMA sistemáticamente el p-value real,
+    inflando la tasa de falsos positivos ("homeostasis detectable" con
+    mayor frecuencia de la que el modelo realmente sustenta). Se reporta
+    tanto el p-value naive (chi2(1) estándar, solo a modo de referencia)
+    como el p-value corregido, que es el que debe usarse para la decisión.
+
+    Además (punto 7), se calculan errores estándar robustos tipo sandwich
+    (OPG) para (a, b, gamma) del modelo no restringido — antes esta app no
+    reportaba ningún error estándar.
     """
     try:
+        if Qs_precomputed is None:
+            Qs_precomputed = compute_recursive_Qstress(z_std, H_indicator, Q_bar)
+
         # Modelo restringido (DCC estándar, γ = 0)
-        result_restricted = estimate_dcc_parameters(z_std, H_indicator, Q_bar, 'DCC')
+        result_restricted = estimate_dcc_parameters(z_std, H_indicator, Q_bar, Qs_precomputed, 'DCC')
         log_lik_restricted = -result_restricted.fun
         
         # Modelo no restringido (DCC-H con γ libre)
-        result_unrestricted = estimate_dcc_parameters(z_std, H_indicator, Q_bar, 'DCC-H')
+        result_unrestricted = estimate_dcc_parameters(z_std, H_indicator, Q_bar, Qs_precomputed, 'DCC-H')
         log_lik_unrestricted = -result_unrestricted.fun
         
         # Estadístico LR
@@ -583,25 +917,39 @@ def likelihood_ratio_test(z_std, H_indicator, Q_bar):
         # Grados de libertad
         df = len(result_unrestricted.x) - len(result_restricted.x)
         
-        # P-value
-        p_value = 1 - chi2.cdf(lr_stat, df) if lr_stat > 0 else 1.0
+        # P-value naive (chi2 estándar) y corregido (mezcla de frontera)
+        p_value_naive = 1 - chi2.cdf(lr_stat, df) if lr_stat > 0 else 1.0
+        p_value = 0.5 * p_value_naive  # <- p-value a usar para la decisión
+
+        # Valores críticos: naive (3.84 para df=1) y corregido (2.71 para df=1)
+        critical_value_naive = chi2.ppf(0.95, df)
+        critical_value = chi2.ppf(0.90, df)  # equivalente, tras la corrección, a LR>2.71
         
-        # Valor crítico
-        critical_value = chi2.ppf(0.95, df)
-        
-        # Decisión
+        # Decisión (basada en el p-value CORREGIDO)
         decision = "RECHAZAR_H0" if p_value < 0.05 else "NO_RECHAZAR_H0"
+
+        se_unrestricted = None
+        if compute_se:
+            try:
+                se_unrestricted = compute_opg_se(z_std, H_indicator, Q_bar, Qs_precomputed,
+                                                   result_unrestricted.x)
+            except Exception:
+                se_unrestricted = None
         
         return {
             'lr_statistic': lr_stat,
             'df': df,
             'p_value': p_value,
+            'p_value_naive': p_value_naive,
             'critical_value': critical_value,
+            'critical_value_naive': critical_value_naive,
             'decision': decision,
             'log_lik_restricted': log_lik_restricted,
             'log_lik_unrestricted': log_lik_unrestricted,
             'params_restricted': result_restricted.x,
-            'params_unrestricted': result_unrestricted.x
+            'params_unrestricted': result_unrestricted.x,
+            'se_unrestricted': se_unrestricted,
+            'Qs_precomputed': Qs_precomputed,
         }
     
     except Exception as e:
@@ -609,13 +957,88 @@ def likelihood_ratio_test(z_std, H_indicator, Q_bar):
             'lr_statistic': 0.0,
             'df': 1,
             'p_value': 1.0,
-            'critical_value': 3.8415,
+            'p_value_naive': 1.0,
+            'critical_value': 2.7055,
+            'critical_value_naive': 3.8415,
             'decision': 'NO_RECHAZAR_H0',
             'log_lik_restricted': -1000.0,
             'log_lik_unrestricted': -1000.0,
             'params_restricted': [0.0, 0.9],
-            'params_unrestricted': [0.0, 0.9, 0.0]
+            'params_unrestricted': [0.0, 0.9, 0.0],
+            'se_unrestricted': None,
+            'Qs_precomputed': None,
         }
+
+
+def benjamini_hochberg(pvalues, alpha=0.05):
+    """
+    Corrección por comparaciones múltiples de Benjamini-Hochberg (FDR).
+    Punto 8 de la adenda doctoral (Sección 4.6): al explorar una grilla de
+    especificaciones (distintos alpha de Gumbel, distintos kappa, distintas
+    ventanas), reportar el mejor resultado sin corrección expone a la tesis
+    a una crítica clásica de data snooping (White, 2000). Se prefiere BH
+    sobre Bonferroni por ser menos conservadora cuando los períodos/
+    especificaciones no son independientes entre sí.
+    """
+    pvalues = np.asarray(pvalues, dtype=float)
+    m = len(pvalues)
+    if m == 0:
+        return {'adjusted_pvalues': np.array([]), 'significant': np.array([]), 'cutoff': 0.0}
+
+    order = np.argsort(pvalues)
+    ranked = pvalues[order]
+    thresh = (np.arange(1, m + 1) / m) * alpha
+    passed = ranked <= thresh
+
+    if passed.any():
+        k_max = np.max(np.where(passed)[0])
+        cutoff = ranked[k_max]
+    else:
+        cutoff = 0.0
+
+    adj = np.minimum.accumulate((ranked * m / np.arange(1, m + 1))[::-1])[::-1]
+    adj = np.clip(adj, 0, 1)
+    adj_pvalues = np.empty(m)
+    adj_pvalues[order] = adj
+
+    significant = pvalues <= cutoff if cutoff > 0 else np.zeros(m, dtype=bool)
+    return {'adjusted_pvalues': adj_pvalues, 'significant': significant, 'cutoff': float(cutoff)}
+
+
+def run_robustness_panel(returns, alpha_grid, kappa_grid, garch_window=252):
+    """
+    Panel de robustez (punto 8): re-ejecuta GARCH -> Gumbel -> H_t -> DCC-H
+    -> Test LR (corregido) para cada combinación (alpha, kappa) de la
+    grilla, y aplica la corrección de Benjamini-Hochberg sobre el conjunto
+    completo de p-values obtenidos, dejando explícito el número total de
+    especificaciones evaluadas.
+    """
+    z_std, sigma, garch_params_df, garch_state = garch_filter(returns)
+    Q_bar_full = np.corrcoef(z_std.T)
+    Q_bar_full = ensure_positive_definite(Q_bar_full, min_eig=1e-6)
+
+    rows = []
+    for a_g in alpha_grid:
+        for k_g in kappa_grid:
+            _, indicators, _ = fit_gumbel_threshold(z_std, a_g, garch_window)
+            H_t_g, prop_g = calculate_systemic_indicator(indicators, k_g)
+            lr_res = likelihood_ratio_test(z_std, H_t_g, Q_bar_full, compute_se=False)
+            rows.append({
+                'alpha_gumbel': a_g,
+                'kappa': k_g,
+                'dias_Ht': int(H_t_g.sum()),
+                'pct_Ht': float(H_t_g.mean() * 100),
+                'LR_stat': lr_res['lr_statistic'],
+                'p_value_corregido': lr_res['p_value'],
+                'gamma': float(lr_res['params_unrestricted'][2]) if len(lr_res['params_unrestricted']) > 2 else np.nan,
+            })
+
+    df = pd.DataFrame(rows)
+    bh = benjamini_hochberg(df['p_value_corregido'].values, alpha=0.05)
+    df['p_value_ajustado_BH'] = bh['adjusted_pvalues']
+    df['significativo_BH'] = bh['significant']
+    df['n_especificaciones_evaluadas'] = len(df)
+    return df
 
 # ============================================================================
 # ⚠️ BACKTESTING DE VaR
@@ -686,7 +1109,26 @@ def backtest_var(returns, var_series, confidence=0.95):
 def out_of_sample_validation(prices, valid_tickers, train_ratio=0.7, confidence_gumbel=0.95, 
                              kappa_threshold=0.3, var_confidence=0.95, garch_window=252):
     """
-    Validación Out-of-Sample pura evitando el Look-Ahead Bias.
+    Validación Out-of-Sample pura, evitando el Look-Ahead Bias.
+
+    CORRECCIÓN respecto de la versión anterior: se detectaron y corrigieron
+    DOS fuentes de fuga de información desde el período de prueba hacia el
+    de entrenamiento:
+
+    1) GARCH re-estimado de forma independiente sobre el propio test set
+       (incluyendo su inicialización con la varianza incondicional DEL
+       TEST). Ahora el GARCH se estima SOLO en entrenamiento, y se aplica
+       congelado sobre el test, continuando la recursión de sigma² desde el
+       último estado observado en entrenamiento (garch_filter_apply_fixed).
+
+    2) Q^(S) se recalculaba dentro de dcc_homeostatic() usando z_std_test y
+       H_t_test — es decir, usando información del propio período de
+       prueba (incluyendo días *posteriores* a cada t pronosticado). Ahora
+       Q^(S)_t se calcula de forma recursiva sobre la serie COMBINADA
+       (entrenamiento + prueba, en ese orden temporal), de modo que al
+       proyectar sobre el test set solo se usa información estrictamente
+       pasada respecto de cada t (que puede incluir historia de
+       entrenamiento, pero nunca del futuro del propio test).
     """
     returns = calculate_returns(prices)
     
@@ -703,31 +1145,60 @@ def out_of_sample_validation(prices, valid_tickers, train_ratio=0.7, confidence_
     returns_test = returns.iloc[n_train:]
     
     # ========== FASE DE ENTRENAMIENTO ==========
-    z_std_train, sigma_train = garch_filter(returns_train)
-    thresholds_train, indicators_train = fit_gumbel_threshold(z_std_train, confidence_gumbel, garch_window)
+    z_std_train, sigma_train, garch_params_train, garch_state = garch_filter(returns_train)
+    _, indicators_train, _ = fit_gumbel_threshold(z_std_train, confidence_gumbel, garch_window)
     H_t_train, prop_stressed_train = calculate_systemic_indicator(indicators_train, kappa_threshold)
     
-    # Estimar parámetros libres (Train)
     Q_bar_train = np.corrcoef(z_std_train.T)
-    R_t_train, Q_t_train, p_train = dcc_homeostatic(z_std_train, H_t_train, Q_bar_train)
+    Q_bar_train = ensure_positive_definite(Q_bar_train, min_eig=1e-6)
+
+    # Qs recursivo calculado SOLO con el tramo de entrenamiento, para estimar
+    # (a, b, gamma) sin ninguna información del test.
+    Qs_train = compute_recursive_Qstress(z_std_train, H_t_train, Q_bar_train)
+    R_t_train, Q_t_train, p_train = dcc_homeostatic(z_std_train, H_t_train, Q_bar_train,
+                                                      Qs_precomputed=Qs_train)
     params_train = [p_train['a'], p_train['b'], p_train['gamma']]
     
-    # Estimar DCC Estándar para comparación (Train)
-    _, _, p_std = dcc_homeostatic(z_std_train, pd.Series(0, index=H_t_train.index), Q_bar_train)
+    # DCC Estándar para comparación (Train) — gamma=0, Qs irrelevante pero se pasa por consistencia
+    H_zero_train = pd.Series(0, index=H_t_train.index)
+    Qs_zero_train = compute_recursive_Qstress(z_std_train, H_zero_train, Q_bar_train)
+    _, _, p_std = dcc_homeostatic(z_std_train, H_zero_train, Q_bar_train, Qs_precomputed=Qs_zero_train)
     params_std = [p_std['a'], p_std['b'], 0.0]
     
     # ========== FASE DE PRUEBA (OUT-OF-SAMPLE) ==========
-    z_std_test, sigma_test = garch_filter(returns_test)
-    thresholds_test, indicators_test = fit_gumbel_threshold(z_std_test, confidence_gumbel, garch_window)
-    H_t_test, prop_stressed_test = calculate_systemic_indicator(indicators_test, kappa_threshold)
-    
-    # Proyectar utilizando parámetros 'congelados' de Train (Evita sobreajuste/look-ahead)
-    R_t_test, Q_t_test, _ = dcc_homeostatic(z_std_test, H_t_test, Q_bar_train, fixed_params=params_train)
+    # GARCH: parámetros CONGELADOS desde entrenamiento, continuando la
+    # recursión de sigma² (sin reestimar, sin reinicializar con datos del test)
+    z_std_test, sigma_test = garch_filter_apply_fixed(returns_test, garch_state)
+
+    # H_t del test: se calcula causalmente sobre la serie COMBINADA
+    # train+test para que los primeros días de test tengan historia
+    # suficiente (ventana de Gumbel), sin usar ningún dato futuro del test.
+    z_std_full = pd.concat([z_std_train, z_std_test], axis=0)
+    _, indicators_full, _ = fit_gumbel_threshold(z_std_full, confidence_gumbel, garch_window)
+    H_t_full, prop_stressed_full = calculate_systemic_indicator(indicators_full, kappa_threshold)
+    H_t_test = H_t_full.iloc[n_train:]
+    prop_stressed_test = prop_stressed_full.iloc[n_train:]
+
+    # Q^(S) recursivo sobre la serie COMBINADA (causal): al llegar al test,
+    # "sabe" la historia de estrés de entrenamiento, pero nada del futuro
+    # dentro del propio test.
+    Qs_full = compute_recursive_Qstress(z_std_full, H_t_full, Q_bar_train)
+
+    # Proyección con parámetros congelados de Train, sobre la serie completa,
+    # para que Q_{t-1} tenga continuidad real entre train y test; solo se
+    # reporta el tramo de test.
+    R_t_full, Q_t_full, _ = dcc_homeostatic(z_std_full, H_t_full, Q_bar_train,
+                                              fixed_params=params_train, Qs_precomputed=Qs_full)
+    R_t_test = R_t_full[n_train:]
     var_test = calculate_var(returns_test, R_t_test, sigma_test, confidence=var_confidence)
     backtest_oos = backtest_var(returns_test, var_test, var_confidence)
-    
-    # Proyectar Estándar para benchmark
-    R_t_standard, _, _ = dcc_homeostatic(z_std_test, pd.Series(0, index=H_t_test.index), Q_bar_train, fixed_params=params_std)
+
+    # Benchmark DCC estándar, misma lógica, gamma=0
+    H_zero_full = pd.Series(0, index=H_t_full.index)
+    Qs_zero_full = compute_recursive_Qstress(z_std_full, H_zero_full, Q_bar_train)
+    R_t_standard_full, _, _ = dcc_homeostatic(z_std_full, H_zero_full, Q_bar_train,
+                                                fixed_params=params_std, Qs_precomputed=Qs_zero_full)
+    R_t_standard = R_t_standard_full[n_train:]
     var_standard = calculate_var(returns_test, R_t_standard, sigma_test, confidence=var_confidence)
     backtest_standard = backtest_var(returns_test, var_standard, var_confidence)
     
@@ -1132,31 +1603,55 @@ def main():
             st.markdown('<p class="sub-header">📈 2. Cálculo de Retornos y Filtrado GARCH</p>', 
                        unsafe_allow_html=True)
             
-            z_std, sigma = garch_filter(returns)
+            z_std, sigma, garch_params_df, garch_state = garch_filter(returns)
             
             col1, col2 = st.columns(2)
             with col1:
                 st.metric("Retorno Medio Anual", f"{returns.mean().mean()*252:.2%}")
             with col2:
                 st.metric("Volatilidad Anual", f"{returns.std().std()*np.sqrt(252):.2%}")
+
+            with st.expander("📐 Parámetros GARCH(1,1) estimados por activo (MLE) y diagnósticos", expanded=False):
+                st.caption(
+                    "Los parámetros (ω, α, β) ya NO están fijos: se estiman individualmente por "
+                    "Máxima Verosimilitud para cada activo (Sección 3.2.3). Ljung-Box y ARCH-LM "
+                    "verifican que no quede autocorrelación ni heterocedasticidad residual en z_t."
+                )
+                st.dataframe(garch_params_df.style.format({
+                    'omega': '{:.2e}', 'alpha': '{:.4f}', 'beta': '{:.4f}',
+                    'persistencia (a+b)': '{:.4f}',
+                    'Ljung-Box p (z)': '{:.4f}', 'Ljung-Box p (z²)': '{:.4f}',
+                    'ARCH-LM p': '{:.4f}',
+                }), use_container_width=True)
+                n_no_converge = int((~garch_params_df['Convergió']).sum())
+                if n_no_converge > 0:
+                    st.warning(f"⚠️ {n_no_converge} activo(s) no convergieron en la optimización GARCH. "
+                               f"Revisar la calidad de esos ajustes antes de interpretar resultados.")
+                n_lb_reject = int((garch_params_df['Ljung-Box p (z²)'] < 0.05).sum())
+                if n_lb_reject > 0:
+                    st.info(f"ℹ️ {n_lb_reject} activo(s) muestran autocorrelación residual en z² "
+                            f"(Ljung-Box p<0.05): el GARCH(1,1) podría no estar capturando toda la "
+                            f"heterocedasticidad condicional en esos casos.")
             
             # 3. Modelo de Valores Extremos (Gumbel)
             st.markdown("---")
             st.markdown('<p class="sub-header">🎯 3. Distribución de Gumbel y Umbrales</p>', 
                        unsafe_allow_html=True)
             
-            thresholds, indicators = fit_gumbel_threshold(z_std, confidence_gumbel, garch_window)
+            thresholds, indicators, threshold_ts = fit_gumbel_threshold(z_std, confidence_gumbel, garch_window)
             H_t, prop_stressed = calculate_systemic_indicator(indicators, kappa_threshold)
             
             # Mostrar umbrales
             col1, col2 = st.columns(2)
             with col1:
-                st.markdown("**📊 Umbrales por Activo (Gumbel)**")
+                st.markdown("**📊 Umbrales por Activo (Gumbel) — promedio temporal**")
+                st.caption("El umbral τ_t es causal y varía en el tiempo (ventana móvil estrictamente "
+                           "pasada); se muestra aquí su promedio solo a fines de referencia.")
                 threshold_df = pd.DataFrame({
                     'Ticker': list(thresholds.keys()),
-                    'Umbral': list(thresholds.values())
+                    'Umbral (promedio)': list(thresholds.values())
                 })
-                st.dataframe(threshold_df.style.format({'Umbral': '{:.4f}'}))
+                st.dataframe(threshold_df.style.format({'Umbral (promedio)': '{:.4f}'}))
             
             with col2:
                 st.markdown("**📊 Estadísticas de H_t**")
@@ -1223,16 +1718,47 @@ def main():
                     st.metric("Estadístico LR", f"{lr_results['lr_statistic']:.4f}")
                 
                 with col2:
-                    st.metric("Valor Crítico (5%)", f"{lr_results['critical_value']:.4f}")
+                    st.metric("Valor Crítico corregido (5%)", f"{lr_results['critical_value']:.4f}",
+                               help="γ≥0 es una restricción de frontera: bajo H0 el LR sigue una "
+                                    "mezcla 50/50 chi2(0)+chi2(1) (Self & Liang, 1987), no una chi2(1) "
+                                    "estándar. El valor crítico corregido es ≈2.71 en vez de 3.84.")
                 
                 with col3:
-                    st.metric("P-value", f"{lr_results['p_value']:.6f}")
+                    st.metric("P-value corregido", f"{lr_results['p_value']:.6f}",
+                               help=f"P-value naive (chi2(1) sin corregir, NO usar para decisión): "
+                                    f"{lr_results['p_value_naive']:.6f}")
                 
                 with col4:
                     if lr_results['decision'] == "RECHAZAR_H0":
                         st.success("✅ H0 Rechazada")
                     else:
                         st.error("❌ H0 No Rechazada")
+
+                st.caption(
+                    f"⚠️ Corrección de frontera aplicada (Sección 3.6.1): p-value corregido = "
+                    f"0.5 × p-value naive = 0.5 × {lr_results['p_value_naive']:.6f} = "
+                    f"{lr_results['p_value']:.6f}. La decisión se basa en el p-value **corregido**."
+                )
+
+                if lr_results.get('se_unrestricted') is not None:
+                    se = lr_results['se_unrestricted']
+                    a_hat, b_hat, g_hat = lr_results['params_unrestricted'][:3]
+                    se_df = pd.DataFrame({
+                        'Parámetro': ['a (shock)', 'b (persistencia)', 'γ (homeostasis)'],
+                        'Estimación': [a_hat, b_hat, g_hat],
+                        'SE robusto (sandwich/OPG)': se[:3] if len(se) >= 3 else [np.nan]*3,
+                    })
+                    se_df['t-stat'] = se_df['Estimación'] / se_df['SE robusto (sandwich/OPG)'].replace(0, np.nan)
+                    st.markdown("**Errores estándar robustos (Etapa 2, aproximación OPG/sandwich):**")
+                    st.dataframe(se_df.style.format({
+                        'Estimación': '{:.4f}', 'SE robusto (sandwich/OPG)': '{:.4f}', 't-stat': '{:.2f}'
+                    }), use_container_width=True)
+                    st.caption(
+                        "Nota: esta aproximación robustece los errores estándar de la Etapa 2 (DCC), "
+                        "pero no propaga la incertidumbre de la Etapa 1 (parámetros GARCH). Para "
+                        "inferencia doctoral completa, complementar con bootstrap paramétrico "
+                        "(Sección 3.9 de la tesis)."
+                    )
                 
                 # Interpretación
                 if lr_results['decision'] == "RECHAZAR_H0":
@@ -1271,6 +1797,62 @@ def main():
                     'AIC': '{:.4f}',
                     'BIC': '{:.4f}'
                 }))
+
+            # ========================================================================
+            # 🧪 PANEL DE ROBUSTEZ Y CORRECCIÓN POR COMPARACIONES MÚLTIPLES (punto 8)
+            # ========================================================================
+            st.markdown("---")
+            st.markdown('<p class="sub-header">🧪 5b. Panel de Robustez (Corrección por Comparaciones Múltiples)</p>',
+                       unsafe_allow_html=True)
+            st.caption(
+                "Explorar varias combinaciones de α (Gumbel) y κ (umbral sistémico) y reportar solo "
+                "la mejor expone a la tesis a data snooping (White, 2000): con suficientes "
+                "combinaciones, es esperable encontrar alguna 'significativa' por azar. Este panel "
+                "corre la grilla completa y aplica corrección de Benjamini-Hochberg (FDR) sobre el "
+                "conjunto de p-values (Sección 4.6)."
+            )
+
+            colr1, colr2 = st.columns(2)
+            with colr1:
+                alpha_grid_sel = st.multiselect(
+                    "Valores de α (Gumbel) a evaluar",
+                    [0.90, 0.95, 0.97, 0.98, 0.99],
+                    default=sorted(set([confidence_gumbel, 0.95, 0.99]))
+                )
+            with colr2:
+                kappa_grid_sel = st.multiselect(
+                    "Valores de κ (umbral sistémico) a evaluar",
+                    [0.30, 0.45, 0.60],
+                    default=sorted(set([kappa_threshold, 0.30, 0.45]))
+                )
+
+            run_robustness = st.button("▶️ Ejecutar panel de robustez", key="run_robustness_btn")
+            if run_robustness:
+                if not alpha_grid_sel or not kappa_grid_sel:
+                    st.warning("Seleccioná al menos un valor de α y uno de κ.")
+                else:
+                    n_specs = len(alpha_grid_sel) * len(kappa_grid_sel)
+                    with st.spinner(f"Evaluando {n_specs} especificaciones (α × κ)..."):
+                        robustness_df = run_robustness_panel(returns, alpha_grid_sel, kappa_grid_sel, garch_window)
+                    st.info(f"ℹ️ Se evaluaron **{n_specs} especificaciones** en total "
+                            f"(declarado explícitamente para evitar data snooping).")
+                    st.dataframe(robustness_df.style.format({
+                        'pct_Ht': '{:.2f}', 'LR_stat': '{:.4f}',
+                        'p_value_corregido': '{:.6f}', 'gamma': '{:.4f}',
+                        'p_value_ajustado_BH': '{:.6f}',
+                    }), use_container_width=True)
+                    n_sig_raw = int((robustness_df['p_value_corregido'] < 0.05).sum())
+                    n_sig_bh = int(robustness_df['significativo_BH'].sum())
+                    st.markdown(
+                        f"**Resultados significativos sin corrección (p<0.05):** {n_sig_raw} de {n_specs}  \n"
+                        f"**Resultados significativos tras corrección BH-FDR:** {n_sig_bh} de {n_specs}"
+                    )
+                    if n_sig_raw > n_sig_bh:
+                        st.warning(
+                            "⚠️ La corrección por comparaciones múltiples reduce el número de "
+                            "especificaciones que se consideran significativas. Reportar en la tesis "
+                            "los resultados **ajustados**, no los crudos."
+                        )
             
             # ========================================================================
             # 🎯 NUEVA SECCIÓN: CLASIFICACIÓN AUTOMÁTICA DE FASE DEL MERCADO
