@@ -653,8 +653,16 @@ def dcc_likelihood_full(z_std, H_indicator, Q_bar, params, Qs_precomputed,
     b = max(params[1], 1e-8)
     gamma = max(params[2], 1e-8) if len(params) > 2 else 0.0
 
-    # Restricciones para estabilidad
-    if a + b + gamma >= 0.98 or a > 0.5 or b > 0.95:
+    # CORRECCIÓN: el límite anterior (a+b+gamma >= 0.98) era demasiado
+    # restrictivo. En datos financieros reales la persistencia de la
+    # correlación suele ser alta (a+b cercano a 1), por lo que el óptimo
+    # verdadero a menudo cae justo por encima de 0.98 — y el optimizador
+    # (L-BFGS-B, que solo conoce los bounds de caja, no esta restricción
+    # conjunta) podía quedar atrapado devolviendo esta penalización
+    # constante en lugar de encontrar el máximo real. El margen correcto
+    # es el límite teórico de estacionariedad (a+b+gamma < 1), con un
+    # pequeño resguardo numérico.
+    if a + b + gamma >= 0.999:
         return (-1000.0, None) if return_contributions else -1000.0
 
     Z = z_std.values if hasattr(z_std, 'values') else np.asarray(z_std)
@@ -724,6 +732,17 @@ def dcc_likelihood_full(z_std, H_indicator, Q_bar, params, Qs_precomputed,
 def estimate_dcc_parameters(z_std, H_indicator, Q_bar, Qs_precomputed, model_type='DCC-H'):
     """
     Estima parámetros DCC por máxima verosimilitud, usando Q^(S)_t recursivo.
+
+    CORRECCIÓN: se reemplaza L-BFGS-B (que solo respeta bounds de caja
+    individuales) por SLSQP con una restricción explícita a+b+gamma<0.999,
+    el mismo enfoque ya usado en fit_garch11_mle. Antes, la restricción
+    conjunta vivía únicamente como un salto discontinuo dentro de la
+    función de verosimilitud (un "muro" que el optimizador no veía venir),
+    lo que podía dejarlo atrapado devolviendo la penalización constante en
+    lugar de converger al máximo real — visible como un log-likelihood
+    sospechosamente redondo (p. ej. exactamente -1000.0) en el modelo
+    resultante. Con la restricción declarada explícitamente, el optimizador
+    la respeta durante toda la búsqueda, sin discontinuidades.
     """
     def neg_log_lik(params):
         result = dcc_likelihood_full(z_std, H_indicator, Q_bar, params, Qs_precomputed)
@@ -733,19 +752,35 @@ def estimate_dcc_parameters(z_std, H_indicator, Q_bar, Qs_precomputed, model_typ
     
     if model_type == 'DCC-H':
         initial_params = [0.02, 0.92, 0.02]
-        bounds = [(1e-8, 0.3), (0.5, 0.95), (0, 0.3)]
+        bounds = [(1e-8, 0.3), (0.5, 0.999), (0, 0.3)]
+        cons = ({'type': 'ineq', 'fun': lambda p: 0.999 - (p[0] + p[1] + p[2])},)
     else:
         initial_params = [0.02, 0.92]
-        bounds = [(1e-8, 0.3), (0.5, 0.95)]
-    
+        bounds = [(1e-8, 0.3), (0.5, 0.999)]
+        cons = ({'type': 'ineq', 'fun': lambda p: 0.999 - (p[0] + p[1])},)
+
     result = minimize(
         neg_log_lik,
         initial_params,
-        method='L-BFGS-B',
+        method='SLSQP',
         bounds=bounds,
-        options={'maxiter': 2000, 'ftol': 1e-8}
+        constraints=cons,
+        options={'maxiter': 2000, 'ftol': 1e-10}
     )
-    
+
+    # Resguardo: si SLSQP no converge desde el punto de partida por defecto,
+    # reintentar con un segundo punto de partida más conservador antes de
+    # devolver un resultado potencialmente degenerado.
+    if not result.success or result.fun >= 999.0:
+        alt_initial = [0.05, 0.80, 0.05] if model_type == 'DCC-H' else [0.05, 0.80]
+        result_alt = minimize(
+            neg_log_lik, alt_initial, method='SLSQP',
+            bounds=bounds, constraints=cons,
+            options={'maxiter': 2000, 'ftol': 1e-10}
+        )
+        if result_alt.fun < result.fun:
+            result = result_alt
+
     return result
 
 
@@ -770,6 +805,7 @@ def compute_opg_se(z_std, H_indicator, Q_bar, Qs_precomputed, params, h=1e-4):
     params = np.array(params, dtype=float)
     T = len(z_std)
     scores = np.zeros((T, k))
+    degenerate = [False] * k
 
     for j in range(k):
         p_plus = params.copy(); p_plus[j] += h
@@ -778,17 +814,31 @@ def compute_opg_se(z_std, H_indicator, Q_bar, Qs_precomputed, params, h=1e-4):
                                           return_contributions=True)
         _, c_minus = dcc_likelihood_full(z_std, H_indicator, Q_bar, p_minus, Qs_precomputed,
                                            return_contributions=True)
+        # Si alguna de las dos evaluaciones perturbadas cae en una región
+        # inválida/degenerada, el score de ese parámetro es indefinido —
+        # se marca como tal (NaN) en vez de asumir cero, que transmitiría
+        # una certeza falsa (SE=0.0000) sobre un resultado en realidad no
+        # confiable en ese punto.
         if c_plus is None or c_minus is None:
-            scores[:, j] = 0.0
+            degenerate[j] = True
             continue
-        scores[:, j] = (c_plus - c_minus) / (2 * h)
+        diff = c_plus - c_minus
+        if np.allclose(diff, 0.0):
+            degenerate[j] = True
+        scores[:, j] = diff / (2 * h)
 
-    B = scores.T @ scores
-    try:
-        cov = np.linalg.pinv(B)
-        se = np.sqrt(np.clip(np.diag(cov), 0, None))
-    except Exception:
-        se = np.full(k, np.nan)
+    se = np.full(k, np.nan)
+    valid_idx = [j for j in range(k) if not degenerate[j]]
+    if valid_idx:
+        try:
+            B = scores.T @ scores
+            cov = np.linalg.pinv(B)
+            diag = np.diag(cov)
+            for j in valid_idx:
+                if diag[j] > 0:
+                    se[j] = np.sqrt(diag[j])
+        except Exception:
+            pass
     return se
 
 
@@ -824,7 +874,7 @@ def dcc_homeostatic(z_std, H_indicator, Q_bar=None, fixed_params=None, Qs_precom
         log_lik = None
     
     a = float(np.clip(params[0], 1e-8, 0.3))
-    b = float(np.clip(params[1], 0.5, 0.95))
+    b = float(np.clip(params[1], 0.5, 0.999))
     gamma = float(np.clip(params[2] if len(params) > 2 else 0.0, 0, 0.3))
 
     Z = z_std.values if hasattr(z_std, 'values') else np.asarray(z_std)
