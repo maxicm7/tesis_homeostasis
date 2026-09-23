@@ -2,7 +2,7 @@
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
 # Archivo: app_tesis.py
-# Versión: 2.0 — revisión metodológica (septiembre 2026)
+# Versión: 2.2 — definición de tensión 'sorpresa' vs 'estado' (septiembre 2026)
 # Ejecutar: streamlit run app_tesis.py
 #
 # CAMBIOS RESPECTO DE LA VERSIÓN ANTERIOR (el detalle está en cada función):
@@ -26,6 +26,17 @@
 # [11] Clasificador de fases sin huecos y con chequeo de identificación.
 # [12] Detalles: volatilidad, fallback GARCH, fines de semana (BTC), errores
 #      que antes se ocultaban, etiquetas.
+# [13] v2.1: recursión DCC-H vectorizada (idéntica, ~30x más rápida).
+# [14] v2.2: la tensión puede medirse como SORPRESA (residuos z del GARCH,
+#      umbral con ventana móvil — especificación original) o como ESTADO
+#      (retornos brutos, umbral con ventana expansiva). Con la especificación
+#      original, cada activo supera su umbral ≈1% de los días en CUALQUIER
+#      régimen (doble normalización), por lo que H_t no distingue crisis.
+# [15] v2.2: el clasificador ya no etiqueta "Estabilidad" cuando γ no es
+#      significativo por falta de información: informa "sin evidencia
+#      concluyente". Aviso si la ventana es demasiado larga para una fase.
+# [16] v2.2: tablas sin "None", nombre para períodos personalizados, preset
+#      P6 (2022–hoy) y portafolio base con historia larga (^GDAXI, DX-Y.NYB).
 # ============================================================================
 
 import streamlit as st
@@ -36,6 +47,7 @@ from datetime import datetime, timedelta, date
 from scipy.stats import norm, chi2
 from scipy.optimize import minimize
 from scipy.linalg import solve_triangular
+from scipy.signal import lfilter
 from scipy.special import xlogy
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
@@ -83,6 +95,7 @@ def _fase(fase, subfase, color, descripcion, caracteristicas, recomendaciones, n
 
 
 def clasificar_fase(lr_pvalue, kupiec_pvalue, dias_ht_percentage, gamma_identificado=True,
+                    n_informativos=None, min_informativos=10,
                     umbral_bajo=UMBRAL_H_BAJO, umbral_alto=UMBRAL_H_ALTO, alpha_test=ALPHA_TEST):
     """
     Clasifica la fase del mercado. CORRECCIÓN [11]: la versión anterior tenía
@@ -98,8 +111,15 @@ def clasificar_fase(lr_pvalue, kupiec_pvalue, dias_ht_percentage, gamma_identifi
                                 sistémica: posible falla de especificación)
       2) VaR confiable:
            γ significativo:  H% < umbral_bajo -> FASE 1 ; resto -> FASE 2
-           γ no significativo: H% <= umbral_bajo -> FASE 1 (sin activación)
-                               H% >  umbral_bajo -> FASE 4 (Transición)
+           γ no significativo:
+             con < min_informativos días informativos o H% <= umbral_bajo
+                 -> SIN EVIDENCIA CONCLUYENTE [15]
+             resto -> FASE 4 (Transición)
+
+    CORRECCIÓN [15]: la v2.0 etiquetaba "FASE 1: ESTABILIDAD" a períodos con γ
+    no significativo y poca información (p. ej. COVID o 2008). El estudio
+    Monte Carlo muestra que con pocos días informativos el test no tiene
+    potencia, así que un γ no significativo no permite afirmar nada.
 
     NOTA PARA LA TESIS: las reglas que completan los huecos de la versión
     anterior (casos marcados con 'nota') son una propuesta a validar contra
@@ -118,11 +138,19 @@ def clasificar_fase(lr_pvalue, kupiec_pvalue, dias_ht_percentage, gamma_identifi
 
     gamma_sig = lr_pvalue < alpha_test
     var_ok = kupiec_pvalue > alpha_test
+    poca_info = n_informativos is not None and n_informativos < min_informativos
 
     if not var_ok:
         if h > umbral_alto:
-            nota = ('γ es significativo: la corrección homeostática opera pero resulta '
-                    'insuficiente frente a la magnitud del shock.') if gamma_sig else None
+            if gamma_sig:
+                nota = ('γ es significativo: la corrección homeostática opera pero resulta '
+                        'insuficiente frente a la magnitud del shock.')
+            elif poca_info:
+                nota = (f'γ no significativo con solo {n_informativos} días informativos: no es '
+                        'evidencia de mecanismos comprometidos, solo de tensión alta con VaR '
+                        'mal calibrado.')
+            else:
+                nota = None
             return _fase(
                 'FASE 3: SATURACIÓN', 'Mecanismos Comprometidos', '#dc3545',
                 'Tensión sistémica muy alta y VaR que no cubre el riesgo realizado.',
@@ -158,13 +186,18 @@ def clasificar_fase(lr_pvalue, kupiec_pvalue, dias_ht_percentage, gamma_identifi
              '• Activar protocolos si H_t persiste > 5 días'],
             nota)
 
-    if h <= umbral_bajo:
+    if poca_info or h <= umbral_bajo:
+        motivo = (f'solo {n_informativos} días informativos, sin potencia para detectar γ'
+                  if poca_info else f'tensión detectada baja (H_t = {h:.1f}% de los días)')
         return _fase(
-            'FASE 1: ESTABILIDAD', 'Sin activación homeostática relevante', '#28a745',
-            'Baja tensión y VaR bien calibrado; con pocos días de estrés no hay evidencia sobre γ.',
-            ['– γ no significativo (poca información)', '✓ VaR confiable', '✓ Tensión sistémica baja'],
-            ['• Diversificación tradicional', '• Monitoreo estándar'],
-            'Caso no contemplado en la versión anterior del clasificador.')
+            'SIN EVIDENCIA CONCLUYENTE', 'γ no significativo con información insuficiente', '#5a6b7b',
+            f'No se puede afirmar ni descartar un efecto homeostático: {motivo}. Un γ no '
+            'significativo en este caso no equivale a ausencia de homeostasis ni a estabilidad '
+            '(ver estudio Monte Carlo, Sección 3.9).',
+            ['– γ no significativo', f'– {motivo.capitalize()}', '✓ VaR confiable'],
+            ['• No interpretar como "estabilidad" ni como "ausencia de homeostasis"',
+             '• Ampliar la muestra o revisar la definición de tensión (Bloque 2)'],
+            'Reemplaza a la etiqueta "Fase 1: Estabilidad (sin activación)" de la v2.0, que era engañosa.')
     return _fase(
         'FASE 4: TRANSICIÓN', 'Homeostasis Dispersa', '#17a2b8',
         'Hay tensión sistémica pero la corrección no opera de forma sistemática.',
@@ -431,7 +464,8 @@ def _gumbel_lmoments(x):
     return b0 - EULER_GAMMA * scale, scale
 
 
-def gumbel_rolling_params(z_std, window=252, block=5, method='bloques', min_points=10):
+def gumbel_rolling_params(z_std, window=252, block=5, method='bloques', min_points=10,
+                          expanding=False):
     """
     Parámetros de Gumbel causales y variables en el tiempo: en cada t se usa
     solo la ventana [t-window, t-1] de |z|.
@@ -444,6 +478,12 @@ def gumbel_rolling_params(z_std, window=252, block=5, method='bloques', min_poin
     probabilidad 1-α. method='todas' reproduce el criterio anterior (Gumbel
     sobre todas las |z|) únicamente para comparación.
 
+    Con expanding=True [14] el umbral en t usa TODO el pasado disponible
+    [0, t-1] (la ventana `window` pasa a ser solo el mínimo de datos para
+    empezar). El umbral no "se acostumbra" a una crisis: si los extremos se
+    vuelven frecuentes, H_t lo registra. Los bloques se alinean desde el
+    inicio de la muestra y solo se usan bloques completos anteriores a t.
+
     Devuelve dos DataFrames (T x N): loc y scale (NaN durante el burn-in).
     Separar parámetros de umbral permite evaluar cualquier α sin re-ajustar.
     """
@@ -453,8 +493,18 @@ def gumbel_rolling_params(z_std, window=252, block=5, method='bloques', min_poin
     scale = np.full((T, N), np.nan)
     for j in range(N):
         a = A[:, j]
+        if expanding and method == 'bloques':
+            nb = T // block
+            bm = a[:nb * block].reshape(nb, block).max(axis=1)
+            for t in range(window, T):
+                data = bm[:t // block]          # bloques completos antes de t
+                data = data[~np.isnan(data)]
+                if len(data) < min_points:
+                    continue
+                loc[t, j], scale[t, j] = _gumbel_lmoments(data)
+            continue
         for t in range(window, T):
-            w = a[t - window:t]
+            w = a[:t] if expanding else a[t - window:t]
             w = w[~np.isnan(w)]
             if method == 'bloques':
                 m = len(w) // block
@@ -546,7 +596,7 @@ def count_informative_days(H, active, t_start):
     return int(np.sum((H[idx - 1] == 1) & active[idx]))
 
 
-def dcc_recursion(Z, H, Q_bar, Qs, a, b, gamma, store=False):
+def _dcc_recursion_loop(Z, H, Q_bar, Qs, a, b, gamma, store=False):
     """
     Recursión ÚNICA del DCC-H, usada en estimación y en filtrado.  [1]
 
@@ -601,6 +651,44 @@ def dcc_recursion(Z, H, Q_bar, Qs, a, b, gamma, store=False):
             Q_store[t], R_store[t] = Q_t, R_t
         Q_prev = Q_t
     return contrib, ok, Q_store, R_store
+
+
+def _dcc_recursion_vec(Z, H, Q_bar, Qs, a, b, gamma):
+    """
+    Versión vectorizada de la MISMA recursión (resultados idénticos a la de
+    bucle, hasta redondeo). Como Q_t = C_t + b·Q_{t−1} es lineal, se calcula
+    con un filtro IIR (scipy.signal.lfilter) sobre el eje temporal, y la
+    factorización de Cholesky y los sistemas lineales se resuelven en lote.
+    Es ~10-30 veces más rápida; si alguna R_t no es numéricamente DP, se
+    recurre a la versión de bucle, que regulariza paso a paso.
+    """
+    T, N = Z.shape
+    C = np.empty((T, N, N))
+    C[0] = Q_bar
+    if T > 1:
+        Z1 = Z[:-1]
+        C[1:] = (1 - a - b) * Q_bar + a * (Z1[:, :, None] * Z1[:, None, :])
+        if gamma > 0:
+            g = gamma * (np.asarray(H[:-1]) == 1)
+            C[1:] += g[:, None, None] * (Qs[1:] - Q_bar)
+    Q = lfilter([1.0], [1.0, -b], C, axis=0)
+    d = np.sqrt(np.clip(np.einsum('tii->ti', Q), 1e-12, None))
+    R = Q / (d[:, :, None] * d[:, None, :])
+    L = np.linalg.cholesky(R)                       # LinAlgError si alguna falla
+    logdet = 2.0 * np.sum(np.log(np.einsum('tii->ti', L)), axis=1)
+    quad = np.einsum('ti,ti->t', Z, np.linalg.solve(R, Z[:, :, None])[:, :, 0])
+    return -0.5 * (logdet + quad), Q, R
+
+
+def dcc_recursion(Z, H, Q_bar, Qs, a, b, gamma, store=False):
+    """Recursión DCC-H (ver _dcc_recursion_loop): vía rápida vectorizada con respaldo en bucle."""
+    try:
+        contrib, Q, R = _dcc_recursion_vec(Z, H, Q_bar, Qs, a, b, gamma)
+        if np.all(np.isfinite(contrib)):
+            return contrib, True, (Q if store else None), (R if store else None)
+    except np.linalg.LinAlgError:
+        pass
+    return _dcc_recursion_loop(Z, H, Q_bar, Qs, a, b, gamma, store)
 
 
 def _unpack(params):
@@ -821,8 +909,8 @@ def benjamini_hochberg(pvalues, alpha=0.05):
     return {'adjusted_pvalues': adj_p, 'significant': significant, 'cutoff': float(cutoff)}
 
 
-def run_robustness_panel(z_std, loc_df, scale_df, Q_bar, t0, t_start, alpha_grid, kappa_grid,
-                         min_obs=30):
+def run_robustness_panel(z_std, stress_series, loc_df, scale_df, Q_bar, t0, t_start, alpha_grid,
+                         kappa_grid, min_obs=30):
     """
     Panel de robustez (Sección 4.6): re-ejecuta Gumbel → H_t → Q^(S) → LR para
     cada (α, κ) y aplica Benjamini-Hochberg SOLO sobre las especificaciones
@@ -831,7 +919,7 @@ def run_robustness_panel(z_std, loc_df, scale_df, Q_bar, t0, t_start, alpha_grid
     Z = z_std.values
     rows = []
     for a_g in alpha_grid:
-        ind = stress_indicators(z_std, gumbel_thresholds(loc_df, scale_df, a_g))
+        ind = stress_indicators(stress_series, gumbel_thresholds(loc_df, scale_df, a_g))
         for k_g in kappa_grid:
             H_g, _ = calculate_systemic_indicator(ind, k_g)
             Hv = H_g.values
@@ -957,14 +1045,23 @@ def diebold_mariano(loss_a, loss_b, lag=None):
 # 🔄 PIPELINE COMPLETO (sin dependencias de la interfaz)
 # ============================================================================
 
-def _stress_block(z_std, cfg, Q_bar):
-    loc_df, scale_df = gumbel_rolling_params(z_std, cfg['gumbel_window'], cfg['block_size'],
-                                             cfg['gumbel_method'])
+def _stress_block(z_std, returns, cfg, Q_bar):
+    """
+    Bloque 2 + Q^(S). [14] La serie sobre la que se detecta la tensión es:
+      - 'residuos': |z_t| del GARCH (tensión = SORPRESA respecto de la
+        volatilidad reciente; especificación original de la tesis)
+      - 'retornos': |r_t| brutos (tensión = ESTADO de alta volatilidad)
+    Q^(S) y el DCC siempre usan z_t; solo cambia cómo se define H_t.
+    """
+    X = returns.loc[z_std.index] if cfg['stress_base'] == 'retornos' else z_std
+    loc_df, scale_df = gumbel_rolling_params(X, cfg['gumbel_window'], cfg['block_size'],
+                                             cfg['gumbel_method'],
+                                             expanding=(cfg['threshold_window'] == 'expansiva'))
     thr_df = gumbel_thresholds(loc_df, scale_df, cfg['confidence_gumbel'])
-    indicators = stress_indicators(z_std, thr_df)
+    indicators = stress_indicators(X, thr_df)
     H_t, prop = calculate_systemic_indicator(indicators, cfg['kappa'])
     Qs, active = compute_recursive_Qstress(z_std.values, H_t.values, Q_bar, cfg['min_obs_qs'])
-    return loc_df, scale_df, thr_df, indicators, H_t, prop, Qs, active
+    return loc_df, scale_df, thr_df, indicators, H_t, prop, Qs, active, X
 
 
 def out_of_sample_validation(returns, t0, cfg):
@@ -994,7 +1091,8 @@ def out_of_sample_validation(returns, t0, cfg):
     z_full = pd.concat([z_train, z_test], axis=0)
 
     Q_bar_tr = ensure_positive_definite(np.corrcoef(z_train.values.T), min_eig=1e-6)
-    _, _, _, _, H_full, prop_full, Qs_full, act_full = _stress_block(z_full, cfg, Q_bar_tr)
+    _, _, _, _, H_full, prop_full, Qs_full, act_full, _ = _stress_block(z_full, returns, cfg,
+                                                                         Q_bar_tr)
     Z_full, H_arr = z_full.values, H_full.values
 
     Z_tr, H_tr, Qs_tr = Z_full[:t0], H_arr[:t0], Qs_full[:t0]
@@ -1049,7 +1147,8 @@ def run_pipeline_core(prices, cfg):
 
     z_std, sigma, garch_df, _ = garch_filter(returns)
     Q_bar = ensure_positive_definite(np.corrcoef(z_std.values.T), min_eig=1e-6)
-    loc_df, scale_df, thr_df, indicators, H_t, prop, Qs, active = _stress_block(z_std, cfg, Q_bar)
+    (loc_df, scale_df, thr_df, indicators, H_t, prop, Qs, active,
+     stress_series) = _stress_block(z_std, returns, cfg, Q_bar)
 
     t_start = max(t0, 1) if cfg['lik_scope'] == 'ventana' else 1
     Z = z_std.values
@@ -1075,6 +1174,7 @@ def run_pipeline_core(prices, cfg):
         'prices': prices, 'returns': returns, 't0': t0, 't_start': t_start,
         'tickers': list(returns.columns), 'z_std': z_std, 'sigma': sigma,
         'garch_df': garch_df, 'loc_df': loc_df, 'scale_df': scale_df, 'thr_df': thr_df,
+        'stress_series': stress_series,
         'indicators': indicators, 'H_t': H_t, 'prop': prop, 'Q_bar': Q_bar,
         'n_active_window': int(active[t0:].sum()),
         'lr': lr, 'R_h': R_h, 'R_s': R_s, 'var_h': var_h, 'port': port, 'bt': bt,
@@ -1084,7 +1184,8 @@ def run_pipeline_core(prices, cfg):
 
 @st.cache_data(show_spinner=False, max_entries=10)
 def cached_pipeline(tickers, start, end, burn_years, confidence_gumbel, kappa, var_confidence,
-                    gumbel_window, block_size, gumbel_method, min_obs_qs, lik_scope, enable_oos):
+                    gumbel_window, block_size, gumbel_method, min_obs_qs, lik_scope, enable_oos,
+                    stress_base='residuos', threshold_window='movil'):
     dl_start = start - timedelta(days=int(round(365.25 * burn_years)))
     prices, err = download_data(tickers, dl_start, end + timedelta(days=1))
     if prices is None:
@@ -1092,7 +1193,8 @@ def cached_pipeline(tickers, start, end, burn_years, confidence_gumbel, kappa, v
     cfg = dict(analysis_start=start, confidence_gumbel=confidence_gumbel, kappa=kappa,
                var_confidence=var_confidence, gumbel_window=gumbel_window,
                block_size=block_size, gumbel_method=gumbel_method, min_obs_qs=min_obs_qs,
-               lik_scope=lik_scope, enable_oos=enable_oos)
+               lik_scope=lik_scope, enable_oos=enable_oos, stress_base=stress_base,
+               threshold_window=threshold_window)
     try:
         res = run_pipeline_core(prices, cfg)
     except Exception as e:
@@ -1184,14 +1286,17 @@ PRESETS = {
     "Crisis Financiera Global (2008)": (date(2008, 1, 1), date(2008, 12, 31)),
     "Crisis Eurozona (2011)": (date(2011, 1, 1), date(2011, 12, 31)),
     "Período normal (2018–2019)": (date(2018, 1, 1), date(2019, 12, 31)),
+    "Post-pandemia P6 (2022–hoy)": (date(2022, 1, 1), date.today()),
     "Personalizado": None,
 }
 TICKERS_MINIMUM = ['^GSPC', '^STOXX50E', 'TLT', 'GLD', 'UUP', 'EEM']
+# Mismo diseño con historia larga en Yahoo (^STOXX50E arranca ~2007-03, UUP 2007-02)
+TICKERS_MINIMUM_LONG = ['^GSPC', '^GDAXI', 'TLT', 'GLD', 'DX-Y.NYB', 'EEM']
 TICKERS_COMPLETE = ['^GSPC', '^STOXX50E', '^N225', '^VIX', 'TLT', 'HYG',
                     'GLD', 'USO', 'FXE', 'UUP', 'EEM', 'BTC-USD']
 PARAM_KEYS = ['tickers', 'start', 'end', 'burn_years', 'confidence_gumbel', 'kappa',
               'var_confidence', 'gumbel_window', 'block_size', 'gumbel_method',
-              'min_obs_qs', 'lik_scope', 'enable_oos']
+              'min_obs_qs', 'lik_scope', 'enable_oos', 'stress_base', 'threshold_window']
 
 
 def sidebar_config():
@@ -1199,8 +1304,15 @@ def sidebar_config():
 
     st.sidebar.subheader("1. Activos")
     choice = st.sidebar.selectbox("Portafolio predefinido",
-                                  ["Mínimo (6 activos)", "Completo (12 activos)", "Personalizado"])
-    default = TICKERS_COMPLETE if choice.startswith("Completo") else TICKERS_MINIMUM
+                                  ["Mínimo con historia larga (6 activos: ^GDAXI, DX-Y.NYB)",
+                                   "Mínimo original (6 activos: ^STOXX50E, UUP)",
+                                   "Completo (12 activos)", "Personalizado"])
+    if choice.startswith("Completo"):
+        default = TICKERS_COMPLETE
+    elif choice.startswith("Mínimo original"):
+        default = TICKERS_MINIMUM
+    else:
+        default = TICKERS_MINIMUM_LONG
     tickers_input = st.sidebar.text_area("Tickers (separados por coma)", value=", ".join(default))
     tickers = tuple(dict.fromkeys(t.strip() for t in tickers_input.split(",") if t.strip()))
 
@@ -1210,17 +1322,33 @@ def sidebar_config():
         c1, c2 = st.sidebar.columns(2)
         start = c1.date_input("Inicio", value=date(2020, 1, 1))
         end = c2.date_input("Fin", value=date.today())
+        nombre = st.sidebar.text_input("Nombre del período (para la comparativa)", value="")
+        regime = nombre.strip() or f"Personalizado ({start:%Y-%m} a {end:%Y-%m})"
     else:
         start, end = PRESETS[regime]
         st.sidebar.caption(f"Ventana: {start} a {end}")
     burn_years = st.sidebar.slider(
-        "Historia previa (años)", 1, 10, 4,
+        "Historia previa (años)", 1, 10, 3,
         help="Datos anteriores a la ventana que inicializan los umbrales de Gumbel, Q^(S) y la "
              "recursión del DCC. Sin historia previa, γ no se puede identificar en ventanas cortas.")
 
     st.sidebar.subheader("3. Especificación EVT / sistémica")
     st.sidebar.caption("Fijá α y κ ANTES de mirar resultados: es tu especificación principal "
                        "para todos los períodos. Otras combinaciones van al panel de robustez (5b).")
+    base_label = st.sidebar.selectbox(
+        "Tensión medida como",
+        ["Sorpresa: residuos z del GARCH (especificación original)",
+         "Estado: retornos brutos |r|"],
+        help="Sorpresa = extremo respecto de la volatilidad reciente (el GARCH ya la descuenta). "
+             "Estado = extremo respecto de la historia del activo: las crisis generan muchos días "
+             "de tensión.")
+    stress_base = 'residuos' if base_label.startswith("Sorpresa") else 'retornos'
+    win_label = st.sidebar.selectbox(
+        "Ventana del umbral de Gumbel",
+        ["Móvil (últimos N días; especificación original)", "Expansiva (todo el pasado disponible)"],
+        help="Con ventana móvil el umbral se adapta a la crisis y deja de marcarla después de unos "
+             "meses. Con ventana expansiva recuerda las crisis anteriores.")
+    threshold_window = 'movil' if win_label.startswith("Móvil") else 'expansiva'
     method_label = st.sidebar.selectbox("Método Gumbel",
                                         ["Máximos por bloque (recomendado)",
                                          "Todas las |z| (versión anterior, solo comparación)"])
@@ -1228,7 +1356,9 @@ def sidebar_config():
     block_size = st.sidebar.slider("Tamaño de bloque (días)", 2, 22, 5,
                                    disabled=(gumbel_method != 'bloques'),
                                    help="5 = máximos semanales.")
-    gumbel_window = st.sidebar.slider("Ventana móvil de Gumbel (días)", 60, 500, 252)
+    gumbel_window = st.sidebar.slider(
+        "Ventana de Gumbel (días)" if threshold_window == 'movil' else "Mínimo de días para el primer umbral",
+        60, 500, 252)
     confidence_gumbel = st.sidebar.slider("Confianza Gumbel (α)", 0.90, 0.99, 0.95, 0.005)
     kappa = st.sidebar.slider("Umbral sistémico (κ)", 0.15, 0.60, 0.30, 0.05)
     min_obs_qs = st.sidebar.slider(
@@ -1250,8 +1380,21 @@ def sidebar_config():
                confidence_gumbel=round(float(confidence_gumbel), 4), kappa=round(float(kappa), 4),
                var_confidence=round(float(var_confidence), 4), gumbel_window=int(gumbel_window),
                block_size=int(block_size), gumbel_method=gumbel_method, min_obs_qs=int(min_obs_qs),
-               lik_scope=lik_scope, enable_oos=bool(enable_oos))
+               lik_scope=lik_scope, enable_oos=bool(enable_oos), stress_base=stress_base,
+               threshold_window=threshold_window)
     return cfg, regime
+
+
+def _fmt_df(df, formats, na_rep='—'):
+    """
+    Formatea columnas como texto [16]. st.dataframe ignora el na_rep de un
+    Styler y muestra 'None' en los valores faltantes; así se evita.
+    """
+    out = df.copy()
+    for col, f in formats.items():
+        if col in out.columns:
+            out[col] = out[col].map(lambda v: na_rep if pd.isna(v) else f.format(v))
+    return out
 
 
 def _fmt(x, f='{:.4f}'):
@@ -1294,10 +1437,10 @@ def render_results(res, cfg, regime, run_key):
     c[2].metric("Volatilidad portafolio EW (anual)", f"{np.std(port_win, ddof=1) * np.sqrt(252):.2%}")
     with st.expander("📐 Parámetros GARCH(1,1) por activo (MLE) y diagnósticos"):
         gdf = res['garch_df']
-        st.dataframe(gdf.style.format({
+        st.dataframe(_fmt_df(gdf, {
             'omega': '{:.2e}', 'alpha': '{:.4f}', 'beta': '{:.4f}', 'persistencia (a+b)': '{:.4f}',
-            'Ljung-Box p (z)': '{:.4f}', 'Ljung-Box p (z²)': '{:.4f}', 'ARCH-LM p': '{:.4f}'},
-            na_rep='—'), use_container_width=True)
+            'Ljung-Box p (z)': '{:.4f}', 'Ljung-Box p (z²)': '{:.4f}', 'ARCH-LM p': '{:.4f}'}),
+            use_container_width=True)
         n_nc = int((~gdf['Convergió']).sum())
         if n_nc:
             st.warning(f"⚠️ {n_nc} activo(s) no convergieron en la optimización GARCH.")
@@ -1309,11 +1452,23 @@ def render_results(res, cfg, regime, run_key):
     st.markdown("---")
     st.markdown('<p class="sub-header">🎯 3. Valores Extremos (Gumbel) e Indicador H_t</p>',
                 unsafe_allow_html=True)
+    serie_txt = "|z| (residuos del GARCH)" if cfg['stress_base'] == 'residuos' else "|r| (retornos brutos)"
+    ventana_txt = (f"una ventana móvil estrictamente pasada de {cfg['gumbel_window']} días"
+                   if cfg['threshold_window'] == 'movil'
+                   else f"una ventana expansiva (todo el pasado disponible, mínimo {cfg['gumbel_window']} días)")
+    concepto = ("SORPRESA respecto de la volatilidad reciente" if cfg['stress_base'] == 'residuos'
+                else "ESTADO de alta volatilidad respecto de la historia del activo")
+    st.markdown(f"**Definición de tensión:** {concepto}.")
     if cfg['gumbel_method'] == 'bloques':
         st.caption(f"Gumbel ajustada por L-momentos sobre máximos de bloques de {cfg['block_size']} "
-                   f"días, en una ventana móvil estrictamente pasada de {cfg['gumbel_window']} días. "
-                   f"Un activo está en tensión si |z| supera el cuantil α={cfg['confidence_gumbel']} "
-                   f"de esos máximos.")
+                   f"días de {serie_txt}, en {ventana_txt}. Un activo está en tensión si su valor "
+                   f"supera el cuantil α={cfg['confidence_gumbel']} de esos máximos.")
+        if cfg['stress_base'] == 'residuos' and cfg['threshold_window'] == 'movil':
+            tasa = 100 * (1 - cfg['confidence_gumbel'] ** (1 / cfg['block_size']))
+            st.info(f"ℹ️ Con esta construcción, cada activo supera su umbral en ≈{tasa:.1f}% de los días "
+                    "**por construcción, en cualquier régimen**: el GARCH descuenta la volatilidad y la "
+                    "ventana móvil adapta el umbral. H_t mide coincidencia de sorpresas, no crisis. "
+                    "Para medir estado de tensión, usá retornos brutos con ventana expansiva.")
     else:
         st.caption("⚠️ Método de comparación: Gumbel sobre todas las |z| (criterio de la versión "
                    "anterior, no consistente con la teoría de valores extremos).")
@@ -1323,8 +1478,8 @@ def render_results(res, cfg, regime, run_key):
         tdf = pd.DataFrame({'Ticker': tickers,
                             'Umbral promedio (ventana)': thr_win.mean().values,
                             '% días en tensión': res['indicators'].iloc[t0:].mean().values * 100})
-        st.dataframe(tdf.style.format({'Umbral promedio (ventana)': '{:.3f}',
-                                       '% días en tensión': '{:.1f}'}, na_rep='—'))
+        st.dataframe(_fmt_df(tdf, {'Umbral promedio (ventana)': '{:.4f}',
+                                   '% días en tensión': '{:.1f}'}))
     with c2:
         st.metric("Días con H_t=1 (ventana)", int(H_win.sum()))
         st.metric("Porcentaje del tiempo", f"{H_win.mean() * 100:.1f}%")
@@ -1395,9 +1550,9 @@ def render_results(res, cfg, regime, run_key):
                 't (sandwich)': t_stat,
                 'En frontera': ['sí' if f else 'no' for f in se['frontera']]})
             st.markdown("**Errores estándar de la Etapa 2:**")
-            st.dataframe(se_df.style.format({'Estimación': '{:.4f}', 'SE sandwich': '{:.4f}',
-                                             'SE OPG': '{:.4f}', 't (sandwich)': '{:.2f}'},
-                                            na_rep='—'), use_container_width=True)
+            st.dataframe(_fmt_df(se_df, {'Estimación': '{:.4f}', 'SE sandwich': '{:.4f}',
+                                         'SE OPG': '{:.4f}', 't (sandwich)': '{:.2f}'}),
+                         use_container_width=True)
             st.caption("En frontera (p. ej. γ≈0) el SE y el t no tienen distribución normal y no se "
                        "reportan: la inferencia sobre γ se basa en el test LR corregido. Estos SE no "
                        "propagan la incertidumbre de la Etapa 1 (GARCH); complementar con bootstrap "
@@ -1420,7 +1575,7 @@ def render_results(res, cfg, regime, run_key):
     comp['AIC'] = -2 * comp['Log-Likelihood'] + 2 * comp['Parámetros']
     comp['BIC'] = -2 * comp['Log-Likelihood'] + comp['Parámetros'] * np.log(n_lik)
     st.markdown("### 📊 Comparación de modelos")
-    st.dataframe(comp.style.format({'Log-Likelihood': '{:.4f}', 'AIC': '{:.4f}', 'BIC': '{:.4f}'}))
+    st.dataframe(_fmt_df(comp, {'Log-Likelihood': '{:.4f}', 'AIC': '{:.4f}', 'BIC': '{:.4f}'}))
 
     # ---------------------------------------------------------------- 5b. Robustez
     st.markdown("---")
@@ -1443,7 +1598,8 @@ def render_results(res, cfg, regime, run_key):
             with st.spinner(f"Evaluando {n_specs} especificaciones..."):
                 try:
                     st.session_state[rob_key] = run_robustness_panel(
-                        res['z_std'], res['loc_df'], res['scale_df'], res['Q_bar'], t0,
+                        res['z_std'], res['stress_series'], res['loc_df'], res['scale_df'],
+                        res['Q_bar'], t0,
                         res['t_start'], a_sel, k_sel, cfg['min_obs_qs'])
                 except Exception as e:
                     st.error(f"Error en el panel de robustez: {e}")
@@ -1452,9 +1608,9 @@ def render_results(res, cfg, regime, run_key):
         n_specs = int(rdf['n_especificaciones_evaluadas'].iloc[0])
         n_id = int(rdf['n_especificaciones_identificadas'].iloc[0])
         st.info(f"Se evaluaron **{n_specs} especificaciones**; γ identificado en **{n_id}**.")
-        st.dataframe(rdf.style.format({'pct_Ht_ventana': '{:.2f}', 'LR_stat': '{:.4f}',
-                                       'p_value_corregido': '{:.6f}', 'gamma': '{:.4f}',
-                                       'p_value_ajustado_BH': '{:.6f}'}, na_rep='—'),
+        st.dataframe(_fmt_df(rdf, {'pct_Ht_ventana': '{:.2f}', 'LR_stat': '{:.4f}',
+                                   'p_value_corregido': '{:.6f}', 'gamma': '{:.4f}',
+                                   'p_value_ajustado_BH': '{:.6f}'}, na_rep='no identificado'),
                      use_container_width=True)
         n_raw = int((rdf['p_value_corregido'] < 0.05).sum())
         n_bh = int(rdf['significativo_BH'].sum())
@@ -1469,7 +1625,12 @@ def render_results(res, cfg, regime, run_key):
     st.markdown('<p class="sub-header">🎯 6. Clasificación Automática de Fase</p>',
                 unsafe_allow_html=True)
     dias_ht_pct = float(H_win.mean() * 100)
-    fase_info = clasificar_fase(lr['p_value'], bt['kupiec_pvalue'], dias_ht_pct, lr['identificado'])
+    fase_info = clasificar_fase(lr['p_value'], bt['kupiec_pvalue'], dias_ht_pct, lr['identificado'],
+                                n_informativos=lr['n_informativos'])
+    if len(dates) > 3 * 252:
+        st.warning(f"⚠️ La ventana tiene {len(dates)} días (más de 3 años): probablemente contiene varios "
+                   "regímenes, y una única fase los promedia. Para clasificar fases usá ventanas acotadas "
+                   "a un episodio.")
     mostrar_fase_detectada(fase_info)
 
     # ---------------------------------------------------------------- 7. VaR
@@ -1542,19 +1703,24 @@ def render_results(res, cfg, regime, run_key):
     if run_key not in hist:
         hist[run_key] = {
             'Período': regime, 'Ventana': f"{dates[0]:%Y-%m-%d} a {dates[-1]:%Y-%m-%d}",
-            'Activos': len(tickers), 'Método EVT': cfg['gumbel_method'],
+            'Activos': len(tickers),
+            'Tensión': 'sorpresa (z)' if cfg['stress_base'] == 'residuos' else 'estado (r)',
+            'Umbral': cfg['threshold_window'], 'Método EVT': cfg['gumbel_method'],
             'α Gumbel': cfg['confidence_gumbel'], 'κ': cfg['kappa'],
             'Días H_t': int(H_win.sum()), '% H_t': round(dias_ht_pct, 2),
             'Días informativos γ': lr['n_informativos'], 'γ': round(float(g_h), 4),
             'LR p corregido': lr['p_value'], 'Kupiec p': round(bt['kupiec_pvalue'], 4),
             'Fase': fase_info['fase']}
     hist_df = pd.DataFrame(list(hist.values()))
-    st.dataframe(hist_df.style.format({'LR p corregido': '{:.6f}'}, na_rep='no identificado'),
+    st.dataframe(_fmt_df(hist_df, {'LR p corregido': '{:.6f}', 'γ': '{:.4f}', '% H_t': '{:.2f}',
+                                   'α Gumbel': '{:.3f}', 'κ': '{:.2f}', 'Kupiec p': '{:.4f}'},
+                         na_rep='no identificado'),
                  use_container_width=True)
     st.download_button("📥 Descargar comparativa (CSV)", hist_df.to_csv(index=False),
                        file_name=f"dcc_h_comparativa_{datetime.now():%Y%m%d}.csv", mime="text/csv")
     st.info("**Leyenda:** FASE 1 Estabilidad · FASE 2 Shock exógeno · FASE 3 Saturación · "
-            "FASE 4 Transición · INDETERMINADA (γ no identificado o VaR mal calibrado sin tensión alta)")
+            "FASE 4 Transición · SIN EVIDENCIA CONCLUYENTE (γ no significativo con poca información) · "
+            "INDETERMINADA (γ no identificado o VaR mal calibrado sin tensión alta)")
 
     # ---------------------------------------------------------------- 10. Exportar
     st.markdown("---")
@@ -1566,6 +1732,7 @@ def render_results(res, cfg, regime, run_key):
     c1.download_button("📥 Series temporales de la ventana (CSV)", series_df.to_csv(index=False),
                        file_name=f"dcc_h_series_{datetime.now():%Y%m%d}.csv", mime="text/csv")
     summary = {'Modelo': 'DCC-GARCH Homeostático', 'Activos': len(tickers),
+               'Tensión': cfg['stress_base'], 'Ventana umbral': cfg['threshold_window'],
                'Ventana': f"{dates[0]:%Y-%m-%d} a {dates[-1]:%Y-%m-%d}",
                'Historia previa (obs.)': t0, 'Método EVT': cfg['gumbel_method'],
                'Bloque': cfg['block_size'], 'Ventana Gumbel': cfg['gumbel_window'],
@@ -1641,3 +1808,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
