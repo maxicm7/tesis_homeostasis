@@ -6,6 +6,9 @@
 #           estimador directamente de la app, de modo que lo que se valida es
 #           exactamente el código que produce los resultados empíricos.
 #
+# Versión 1.2: la tensión del DGP puede definirse como SORPRESA (|z|) o como
+# ESTADO (|r|, retornos con volatilidad GARCH), con umbral móvil o expansivo,
+# igual que en la app v2.2+. Requiere app v2.2 o posterior.
 # Versión 1.1: verifica que la app importada sea v2.1+ (acepta también
 # app_tesis_fase_mercado.py), informa por qué fallan las réplicas y trae una
 # interfaz propia si se ejecuta con "streamlit run montecarlo_dcch.py".
@@ -41,8 +44,12 @@
 #      "crisis"; eso rompe el supuesto de varianza unitaria y el DGP deja de ser
 #      un DCC-H: con esos datos γ no se recupera ni con las matrices verdaderas.)
 #   4. H_t se calcula con LA MISMA regla que la app (Gumbel sobre máximos por
-#      bloque, ventana causal, α y κ): el estrés que "activa" γ es el
-#      detectado por el modelo, tal como postula la tesis.
+#      bloque, α y κ, umbral causal móvil o expansivo): el estrés que "activa"
+#      γ es el detectado por el modelo, tal como postula la tesis.
+#      --tension sorpresa: H_t sobre |z_t| (especificación original).
+#      --tension estado:   H_t sobre |r_t|, con r_t = σ_t·z_t y σ_t de un
+#      GARCH(1,1) por activo; los períodos de alta volatilidad generan
+#      episodios de tensión, como en los datos reales.
 #   5. Cada réplica = historia previa (burn-in, por defecto 756 días = 3 años)
 #      + ventana de análisis de largo T. La verosimilitud se evalúa solo sobre
 #      la ventana, igual que la opción "Solo la ventana de análisis" de la app.
@@ -101,11 +108,15 @@ def _load_estimator():
             continue
         missing = [f for f in REQUIRED if not hasattr(mod, f)]
         if not missing:
+            import inspect
+            if 'expanding' not in inspect.signature(mod.gumbel_rolling_params).parameters:
+                missing = ['gumbel_rolling_params(expanding=...) de la v2.2']
+        if not missing:
             return mod
         tried.append(f"- {name}.py ({getattr(mod, '__file__', '?')}): es una VERSIÓN ANTERIOR "
                      f"de la app; le faltan: {', '.join(missing)}")
     raise ImportError(
-        "El Monte Carlo necesita la app v2.1 o posterior en la misma carpeta, con el nombre "
+        "El Monte Carlo necesita la app v2.2 o posterior en la misma carpeta, con el nombre "
         "app_tesis.py (o app_tesis_fase_mercado.py). Se buscó:\n" + "\n".join(tried) +
         "\nReemplazá ese archivo por la última versión de la app y volvé a ejecutar.")
 
@@ -128,7 +139,8 @@ def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Monte Carlo del estimador DCC-H (Sección 3.9)")
     p.add_argument('--gammas', type=float, nargs='+', default=[0.0, 0.03, 0.07],
                    help="γ verdaderos (con a=0.02, b=0.90 debe ser γ < 0.079)")
-    p.add_argument('--T', type=int, nargs='+', default=[126, 252, 1000], help="Largos de la ventana")
+    p.add_argument('--T', type=int, nargs='+', default=[252, 1000, 4000],
+                   help="Largos de la ventana (4000 ≈ muestra larga 2008–hoy)")
     p.add_argument('--reps', type=int, default=200, help="Réplicas por combinación (γ, T)")
     p.add_argument('--hist', type=int, default=756, help="Días de historia previa (burn-in)")
     p.add_argument('--N', type=int, default=6, help="Número de activos")
@@ -136,6 +148,13 @@ def parse_args(argv=None):
     p.add_argument('--b', type=float, default=0.90)
     p.add_argument('--rho-bar', type=float, default=0.30, help="Correlación de Q̄")
     p.add_argument('--rho-s', type=float, default=0.70, help="Correlación de Q^(S)")
+    p.add_argument('--tension', choices=['estado', 'sorpresa'], default='estado',
+                   help="Serie para H_t: estado = retornos |r|; sorpresa = residuos |z|")
+    p.add_argument('--umbral', choices=['expansiva', 'movil'], default='expansiva',
+                   help="Ventana del umbral de Gumbel")
+    p.add_argument('--garch-alpha', type=float, default=0.08, help="α del GARCH de los retornos")
+    p.add_argument('--garch-beta', type=float, default=0.90, help="β del GARCH de los retornos")
+    p.add_argument('--vol', type=float, default=0.01, help="Volatilidad diaria incondicional")
     p.add_argument('--nu', type=float, default=5.0,
                    help="Grados de libertad de la t multivariada (0 = normal)")
     p.add_argument('--alpha', type=float, default=0.95, help="Confianza Gumbel (α)")
@@ -158,6 +177,16 @@ def equicorr(N, rho):
 # 🎲 SIMULACIÓN DEL DGP
 # ============================================================================
 
+def _gumbel_threshold_from_maxima(maxima, alpha):
+    """Cuantil α de Gumbel ajustada por L-momentos a los máximos (mínimo 10)."""
+    if len(maxima) < 10:
+        return np.nan
+    loc, scale = A._gumbel_lmoments(np.asarray(maxima))
+    if not np.isfinite(loc):
+        return np.nan
+    return loc - scale * np.log(-np.log(alpha))
+
+
 def _gumbel_threshold_from_window(window_abs, block, alpha):
     """Umbral de Gumbel sobre máximos por bloque (misma regla que la app)."""
     m = len(window_abs) // block
@@ -172,16 +201,25 @@ def _gumbel_threshold_from_window(window_abs, block, alpha):
 
 def simulate_dcch(rng, T_total, gamma, cfg):
     """
-    Simula z_t (T_total x N) y el H_t verdadero del DCC-H con innovaciones t
-    multivariadas estandarizadas. H_t se determina con la regla de la app
-    sobre los z ya simulados (causal).
+    Simula z_t (T_total x N), los retornos r_t = σ_t·z_t (GARCH por activo) y el
+    H_t verdadero del DCC-H con innovaciones t multivariadas estandarizadas.
+    H_t se determina con la regla de la app (causal) sobre |r| (estado) o |z|
+    (sorpresa), con umbral móvil o expansivo.
     """
     N, a, b = cfg['N'], cfg['a'], cfg['b']
     Q_bar, Q_S = equicorr(N, cfg['rho_bar']), equicorr(N, cfg['rho_s'])
     W, block, alpha, kappa = cfg['gumbel_window'], cfg['block'], cfg['alpha'], cfg['kappa']
 
     Z = np.zeros((T_total, N))
+    Rr = np.zeros((T_total, N))
+    X = np.zeros((T_total, N))            # serie de tensión: |r| o |z|
     H = np.zeros(T_total, dtype=int)
+    use_returns = cfg['tension'] == 'estado'
+    expanding = cfg['umbral'] == 'expansiva'
+    ga, gb, vol = cfg['garch_alpha'], cfg['garch_beta'], cfg['vol']
+    omega = vol ** 2 * (1 - ga - gb)
+    sigma2 = np.full(N, vol ** 2)
+    maxima = [[] for _ in range(N)]       # máximos de bloques completos (umbral expansivo)
     nu = cfg['nu']
     t_scale = np.sqrt((nu - 2) / nu) if nu > 2 else 1.0
     Q_prev = Q_bar
@@ -201,27 +239,36 @@ def simulate_dcch(rng, T_total, gamma, cfg):
         if nu > 2:   # t multivariada con varianza unitaria (mezcla de escala común)
             e = e * t_scale / np.sqrt(rng.chisquare(nu) / nu)
         Z[t] = np.linalg.cholesky(R_t) @ e
+        if t > 0:
+            sigma2 = omega + ga * Rr[t - 1] ** 2 + gb * sigma2
+        Rr[t] = np.sqrt(sigma2) * Z[t]
+        X[t] = np.abs(Rr[t]) if use_returns else np.abs(Z[t])
 
+        if expanding and t > 0 and t % block == 0:     # se cerró el bloque [t-block, t)
+            for j in range(N):
+                maxima[j].append(X[t - block:t, j].max())
         if t >= W:
-            absw = np.abs(Z[t - W:t])
             h = 0
             for j in range(N):
-                thr = _gumbel_threshold_from_window(absw[:, j], block, alpha)
-                if np.isfinite(thr) and abs(Z[t, j]) > thr:
+                thr = (_gumbel_threshold_from_maxima(maxima[j], alpha) if expanding
+                       else _gumbel_threshold_from_window(X[t - W:t, j], block, alpha))
+                if np.isfinite(thr) and X[t, j] > thr:
                     h += 1
             H[t] = int(h / N >= kappa)
         Q_prev = Q_t
-    return Z, H
+    return Z, Rr, H
 
 
 # ============================================================================
 # 📐 ESTIMACIÓN (exactamente el pipeline de la app, Etapa 2)
 # ============================================================================
 
-def estimate_replica(Z, t0, cfg):
-    z_df = pd.DataFrame(Z)
-    loc, scale = A.gumbel_rolling_params(z_df, cfg['gumbel_window'], cfg['block'], 'bloques')
-    ind = A.stress_indicators(z_df, A.gumbel_thresholds(loc, scale, cfg['alpha']))
+def estimate_replica(Z, Rr, t0, cfg):
+    """Pipeline de la app (Etapa 2): H_t sobre la serie elegida; Q^(S) y DCC sobre z."""
+    x_df = pd.DataFrame(Rr if cfg['tension'] == 'estado' else Z)
+    loc, scale = A.gumbel_rolling_params(x_df, cfg['gumbel_window'], cfg['block'], 'bloques',
+                                         expanding=(cfg['umbral'] == 'expansiva'))
+    ind = A.stress_indicators(x_df, A.gumbel_thresholds(loc, scale, cfg['alpha']))
     H_hat, _ = A.calculate_systemic_indicator(ind, cfg['kappa'])
     Hv = H_hat.values
     Q_bar_hat = A.ensure_positive_definite(np.corrcoef(Z.T), min_eig=1e-6)
@@ -238,8 +285,8 @@ def run_replica(task):
     t_start = time.time()
     row = {'gamma_true': gamma, 'T': T, 'rep': rep, 'seed': seed}
     try:
-        Z, H_true = simulate_dcch(rng, t0 + T, gamma, cfg)
-        H_hat, lr = estimate_replica(Z, t0, cfg)
+        Z, Rr, H_true = simulate_dcch(rng, t0 + T, gamma, cfg)
+        H_hat, lr = estimate_replica(Z, Rr, t0, cfg)
         pu = np.asarray(lr['params_unrestricted'], dtype=float)
         row.update({
             'ok': True,
@@ -289,6 +336,7 @@ def summarize(df):
             'replicas_fallidas': int((~d['ok'].astype(bool)).sum()),
             'pct_identificado': 100 * n_id / n if n else np.nan,
             'dias_Ht_ventana_media': ok['dias_Ht_ventana'].mean(),
+            'pct_Ht_ventana_media': 100 * ok['dias_Ht_ventana'].mean() / T if n else np.nan,
             'dias_informativos_media': ok['dias_informativos'].mean(),
             'tasa_rechazo_total': rej,
             'tasa_rechazo_ES_MC': np.sqrt(rej * (1 - rej) / n) if n else np.nan,
@@ -315,7 +363,8 @@ def summary_lines(summ):
             continue
         lines.append(f"  γ identificado en {r['pct_identificado']:.1f}% de las réplicas "
               f"(días informativos promedio: {r['dias_informativos_media']:.1f}; "
-              f"días H_t=1 en la ventana: {r['dias_Ht_ventana_media']:.1f})")
+              f"días H_t=1 en la ventana: {r['dias_Ht_ventana_media']:.1f} = "
+              f"{r['pct_Ht_ventana_media']:.1f}%)")
         lines.append(f"  {tipo}: tasa de rechazo = {100 * r['tasa_rechazo_total']:.1f}% "
               f"(± {196 * r['tasa_rechazo_ES_MC']:.1f} pp al 95%); entre identificadas: "
               f"{100 * r['tasa_rechazo_identificadas']:.1f}%")
@@ -342,8 +391,12 @@ def print_summary(summ):
 def build_cfg(args):
     cfg = {'N': args.N, 'a': args.a, 'b': args.b, 'rho_bar': args.rho_bar, 'rho_s': args.rho_s,
            'nu': args.nu, 'alpha': args.alpha, 'kappa': args.kappa,
+           'tension': args.tension, 'umbral': args.umbral, 'garch_alpha': args.garch_alpha,
+           'garch_beta': args.garch_beta, 'vol': args.vol,
            'gumbel_window': args.gumbel_window, 'block': args.block, 'min_obs': args.min_obs,
            'hist': args.hist}
+    if args.garch_alpha + args.garch_beta >= 1:
+        raise ValueError("El GARCH de los retornos debe ser estacionario: α + β < 1.")
     bad = [g for g in args.gammas if args.a + args.b + g >= 0.999]
     if bad:
         raise ValueError(f"a + b + γ debe ser < 0.999; revisá γ = {bad} (con a={args.a}, b={args.b} "
@@ -452,10 +505,15 @@ def streamlit_main():
     c1, c2, c3 = st.columns(3)
     gammas = c1.multiselect("γ verdaderos", [0.0, 0.01, 0.03, 0.05, 0.07], default=[0.0, 0.03, 0.07],
                             help=f"Con a={d.a} y b={d.b}, la restricción a+b+γ<1 exige γ ≤ {max_g}.")
-    Ts = c2.multiselect("Largos de ventana T (días)", [126, 252, 504, 1000, 2000],
-                        default=[126, 252, 1000])
+    Ts = c2.multiselect("Largos de ventana T (días)", [126, 252, 504, 1000, 2000, 4000],
+                        default=[252, 1000, 4000],
+                        help="4000 ≈ la muestra larga 2008–hoy. Las ventanas largas tardan más.")
     reps = int(c3.number_input("Réplicas por combinación", min_value=5, max_value=1000, value=30,
                                step=5))
+    s1, s2 = st.columns(2)
+    tension = s1.selectbox("Tensión medida como", ["estado", "sorpresa"],
+                           help="estado = retornos |r| con volatilidad GARCH; sorpresa = residuos |z|")
+    umbral = s2.selectbox("Ventana del umbral", ["expansiva", "movil"])
     with st.expander("Parámetros avanzados (DGP y especificación)"):
         a1, a2, a3, a4 = st.columns(4)
         hist = int(a1.number_input("Historia previa (días)", 300, 2000, d.hist, 1))
@@ -467,19 +525,26 @@ def streamlit_main():
         rho_s = float(a6.number_input("ρ_S (Q^(S))", 0.0, 0.95, d.rho_s, 0.05))
         alpha = float(a7.number_input("α Gumbel", 0.90, 0.99, d.alpha, 0.005, format="%.3f"))
         kappa = float(a8.number_input("κ", 0.15, 0.6, d.kappa, 0.05))
-        a9, a10, _, _ = st.columns(4)
+        a9, a10, a11, a12 = st.columns(4)
         min_obs = int(a9.number_input("Mínimo días de estrés Q^(S)", 5, 60, d.min_obs, 1))
         seed = int(a10.number_input("Semilla", 0, 2**31 - 1, d.seed, 1))
+        g_a = float(a11.number_input("α GARCH retornos", 0.0, 0.3, d.garch_alpha, 0.01,
+                                     format="%.3f"))
+        g_b = float(a12.number_input("β GARCH retornos", 0.0, 0.99, d.garch_beta, 0.01,
+                                     format="%.3f"))
 
     n_tot = len(gammas) * len(Ts) * reps
-    st.caption(f"Total: {n_tot} réplicas · tiempo estimado ≈ {max(1, round(n_tot * 0.9 / 60))} min.")
+    seg = sum(len(gammas) * reps * (0.6 + 0.8 * (T + d.hist) / 1000) for T in Ts)
+    st.caption(f"Total: {n_tot} réplicas · tiempo estimado ≈ {max(1, round(seg / 60))} min "
+               "(orientativo; depende del servidor).")
 
     if st.button("▶️ Ejecutar Monte Carlo", type="primary", disabled=(n_tot == 0)):
         argv = ['--gammas', *map(str, gammas), '--T', *map(str, Ts), '--reps', str(reps),
                 '--hist', str(hist), '--a', str(a_p), '--b', str(b_p), '--nu', str(nu),
                 '--rho-bar', str(rho_bar), '--rho-s', str(rho_s), '--alpha', str(alpha),
                 '--kappa', str(kappa), '--min-obs', str(min_obs), '--seed', str(seed),
-                '--workers', '1']
+                '--tension', tension, '--umbral', umbral, '--garch-alpha', str(g_a),
+                '--garch-beta', str(g_b), '--workers', '1']
         args = parse_args(argv)
         try:
             cfg = build_cfg(args)
