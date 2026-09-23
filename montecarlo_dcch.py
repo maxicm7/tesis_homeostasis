@@ -1,10 +1,17 @@
-# ============================================================================
+ ============================================================================
 # 🎲 ESTUDIO MONTE CARLO DEL ESTIMADOR DCC-H (Sección 3.9 de la tesis)
 # ============================================================================
 # Archivo: montecarlo_dcch.py
 # Requiere: app_tesis.py (v2.1 o posterior) en la MISMA carpeta. Se importa el
 #           estimador directamente de la app, de modo que lo que se valida es
 #           exactamente el código que produce los resultados empíricos.
+#
+# Versión 1.1: verifica que la app importada sea v2.1+ (acepta también
+# app_tesis_fase_mercado.py), informa por qué fallan las réplicas y trae una
+# interfaz propia si se ejecuta con "streamlit run montecarlo_dcch.py".
+#
+# Uso en Streamlit (local o Streamlit Cloud):
+#   streamlit run montecarlo_dcch.py
 #
 # Uso (desde una terminal, en la carpeta de los dos archivos):
 #   python montecarlo_dcch.py                      # piloto: γ∈{0,0.03,0.07}, T∈{126,252,1000}, 200 réplicas
@@ -47,8 +54,10 @@
 # ============================================================================
 
 import argparse
+import importlib
 import json
 import logging
+import traceback
 import os
 import sys
 import time
@@ -61,7 +70,54 @@ import pandas as pd
 logging.getLogger("streamlit").setLevel(logging.ERROR)
 os.environ.setdefault("STREAMLIT_LOG_LEVEL", "error")
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import app_tesis as A  # noqa: E402
+
+# Funciones de la app que usa el Monte Carlo. Si falta alguna, el archivo
+# importado es una versión anterior de la app y TODAS las réplicas fallarían.
+REQUIRED = ['_gumbel_lmoments', 'gumbel_rolling_params', 'gumbel_thresholds', 'stress_indicators',
+            'calculate_systemic_indicator', 'ensure_positive_definite',
+            'compute_recursive_Qstress', 'count_informative_days', 'likelihood_ratio_test',
+            '_dcc_recursion_vec']
+CANDIDATES = ['app_tesis', 'app_tesis_fase_mercado']
+
+
+def _running_in_streamlit():
+    try:
+        from streamlit.runtime import exists
+        return bool(exists())
+    except Exception:
+        return False
+
+
+def _load_estimator():
+    tried = []
+    for name in CANDIDATES:
+        try:
+            mod = importlib.import_module(name)
+        except ModuleNotFoundError:
+            tried.append(f"- {name}.py: no está en la carpeta")
+            continue
+        except Exception as e:
+            tried.append(f"- {name}.py: no se pudo importar ({type(e).__name__}: {e})")
+            continue
+        missing = [f for f in REQUIRED if not hasattr(mod, f)]
+        if not missing:
+            return mod
+        tried.append(f"- {name}.py ({getattr(mod, '__file__', '?')}): es una VERSIÓN ANTERIOR "
+                     f"de la app; le faltan: {', '.join(missing)}")
+    raise ImportError(
+        "El Monte Carlo necesita la app v2.1 o posterior en la misma carpeta, con el nombre "
+        "app_tesis.py (o app_tesis_fase_mercado.py). Se buscó:\n" + "\n".join(tried) +
+        "\nReemplazá ese archivo por la última versión de la app y volvé a ejecutar.")
+
+
+try:
+    A = _load_estimator()
+except ImportError as _err:
+    if _running_in_streamlit():
+        import streamlit as _st
+        _st.error(str(_err))
+        _st.stop()
+    sys.exit(str(_err))
 
 
 # ============================================================================
@@ -198,7 +254,9 @@ def run_replica(task):
             'error': '',
         })
     except Exception as e:  # una réplica fallida no detiene el estudio
-        row.update({'ok': False, 'error': repr(e)})
+        tb = traceback.extract_tb(e.__traceback__)
+        donde = f" [en {tb[-1].name}(), línea {tb[-1].lineno}]" if tb else ""
+        row.update({'ok': False, 'error': f"{type(e).__name__}: {e}{donde}"})
     row['segundos'] = round(time.time() - t_start, 2)
     return row
 
@@ -207,18 +265,28 @@ def run_replica(task):
 # 📊 RESUMEN
 # ============================================================================
 
+def error_report(df):
+    """Errores de las réplicas fallidas, agrupados (el mensaje más frecuente primero)."""
+    if 'ok' not in df or df['ok'].all():
+        return pd.Series(dtype=int)
+    return df.loc[~df['ok'].astype(bool), 'error'].value_counts()
+
+
 def summarize(df):
+    """Resumen por (γ, T). Devuelve None si no hubo ninguna réplica exitosa."""
+    if 'identificado' not in df.columns or not df['ok'].astype(bool).any():
+        return None
     out = []
     for (g, T), d in df.groupby(['gamma_true', 'T']):
-        ok = d[d['ok']]
-        ident = ok[ok['identificado']]
+        ok = d[d['ok'].astype(bool)]
+        ident = ok[ok['identificado'].astype(bool)]
         n, n_id = len(ok), len(ident)
-        rej = ok['rechaza_H0'].mean() if n else np.nan
-        rej_id = ident['rechaza_H0'].mean() if n_id else np.nan
+        rej = ok['rechaza_H0'].astype(bool).mean() if n else np.nan
+        rej_id = ident['rechaza_H0'].astype(bool).mean() if n_id else np.nan
         err = ident['gamma_hat'] - g
         out.append({
             'gamma_verdadero': g, 'T_ventana': T, 'replicas_ok': n,
-            'replicas_fallidas': int((~d['ok']).sum()),
+            'replicas_fallidas': int((~d['ok'].astype(bool)).sum()),
             'pct_identificado': 100 * n_id / n if n else np.nan,
             'dias_Ht_ventana_media': ok['dias_Ht_ventana'].mean(),
             'dias_informativos_media': ok['dias_informativos'].mean(),
@@ -232,52 +300,59 @@ def summarize(df):
             'pct_gamma_hat_en_0': 100 * (ident['gamma_hat'] < 1e-4).mean() if n_id else np.nan,
             'sesgo_a': (ok['a_hat'] - float(df.attrs.get('a', np.nan))).mean(),
             'sesgo_b': (ok['b_hat'] - float(df.attrs.get('b', np.nan))).mean(),
-            'H_coincide_DGP_pct': 100 * ok['H_coincide_DGP'].mean() if n else np.nan,
+            'H_coincide_DGP_pct': 100 * ok['H_coincide_DGP'].astype(bool).mean() if n else np.nan,
         })
     return pd.DataFrame(out)
+
+
+def summary_lines(summ):
+    lines = []
+    for _, r in summ.iterrows():
+        tipo = "TAMAÑO (γ=0: debería ser ≈ 5%)" if r['gamma_verdadero'] == 0 else "POTENCIA"
+        lines.append(f"\nγ = {r['gamma_verdadero']:.2f} | T = {int(r['T_ventana'])} | réplicas = "
+              f"{int(r['replicas_ok'])} (fallidas: {int(r['replicas_fallidas'])})")
+        if not r['replicas_ok']:
+            continue
+        lines.append(f"  γ identificado en {r['pct_identificado']:.1f}% de las réplicas "
+              f"(días informativos promedio: {r['dias_informativos_media']:.1f}; "
+              f"días H_t=1 en la ventana: {r['dias_Ht_ventana_media']:.1f})")
+        lines.append(f"  {tipo}: tasa de rechazo = {100 * r['tasa_rechazo_total']:.1f}% "
+              f"(± {196 * r['tasa_rechazo_ES_MC']:.1f} pp al 95%); entre identificadas: "
+              f"{100 * r['tasa_rechazo_identificadas']:.1f}%")
+        if np.isfinite(r['sesgo_gamma']):
+            lines.append(f"  γ̂: media {r['gamma_hat_media']:.4f} | mediana {r['gamma_hat_mediana']:.4f} | "
+                  f"sesgo {r['sesgo_gamma']:+.4f} | RMSE {r['RMSE_gamma']:.4f} | "
+                  f"γ̂≈0 en {r['pct_gamma_hat_en_0']:.0f}%")
+    lines.append("\nNota: 'tasa de rechazo total' cuenta las réplicas sin identificar como no "
+                 "rechazo, que es lo que ocurre en la práctica cuando la app informa 'γ no identificado'.")
+    return lines
 
 
 def print_summary(summ):
     print("\n" + "=" * 100)
     print("RESUMEN DEL MONTE CARLO")
     print("=" * 100)
-    for _, r in summ.iterrows():
-        tipo = "TAMAÑO (γ=0: debería ser ≈ 5%)" if r['gamma_verdadero'] == 0 else "POTENCIA"
-        print(f"\nγ = {r['gamma_verdadero']:.2f} | T = {int(r['T_ventana'])} | réplicas = "
-              f"{int(r['replicas_ok'])} (fallidas: {int(r['replicas_fallidas'])})")
-        print(f"  γ identificado en {r['pct_identificado']:.1f}% de las réplicas "
-              f"(días informativos promedio: {r['dias_informativos_media']:.1f}; "
-              f"días H_t=1 en la ventana: {r['dias_Ht_ventana_media']:.1f})")
-        print(f"  {tipo}: tasa de rechazo = {100 * r['tasa_rechazo_total']:.1f}% "
-              f"(± {196 * r['tasa_rechazo_ES_MC']:.1f} pp al 95%); entre identificadas: "
-              f"{100 * r['tasa_rechazo_identificadas']:.1f}%")
-        if np.isfinite(r['sesgo_gamma']):
-            print(f"  γ̂: media {r['gamma_hat_media']:.4f} | mediana {r['gamma_hat_mediana']:.4f} | "
-                  f"sesgo {r['sesgo_gamma']:+.4f} | RMSE {r['RMSE_gamma']:.4f} | "
-                  f"γ̂≈0 en {r['pct_gamma_hat_en_0']:.0f}%")
-    print("\nNota: 'tasa de rechazo total' cuenta las réplicas sin identificar como no rechazo,")
-    print("que es lo que ocurre en la práctica cuando la app informa 'γ no identificado'.")
+    print("\n".join(summary_lines(summ)))
 
 
 # ============================================================================
 # 🚀 EJECUCIÓN
 # ============================================================================
 
-def main(argv=None):
-    args = parse_args(argv)
+def build_cfg(args):
     cfg = {'N': args.N, 'a': args.a, 'b': args.b, 'rho_bar': args.rho_bar, 'rho_s': args.rho_s,
-           'nu': args.nu,
-           'alpha': args.alpha, 'kappa': args.kappa, 'gumbel_window': args.gumbel_window,
-           'block': args.block, 'min_obs': args.min_obs, 'hist': args.hist}
-    for g in args.gammas:
-        if args.a + args.b + g >= 0.999:
-            sys.exit(f"a + b + γ debe ser < 0.999 (γ = {g}).")
+           'nu': args.nu, 'alpha': args.alpha, 'kappa': args.kappa,
+           'gumbel_window': args.gumbel_window, 'block': args.block, 'min_obs': args.min_obs,
+           'hist': args.hist}
+    bad = [g for g in args.gammas if args.a + args.b + g >= 0.999]
+    if bad:
+        raise ValueError(f"a + b + γ debe ser < 0.999; revisá γ = {bad} (con a={args.a}, b={args.b} "
+                         f"el máximo es γ < {0.999 - args.a - args.b:.3f}).")
+    return cfg
 
-    os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, 'configuracion.json'), 'w', encoding='utf-8') as f:
-        json.dump({**vars(args), 'cfg': cfg}, f, indent=2, ensure_ascii=False)
 
-    # Semillas independientes y reproducibles por réplica
+def build_tasks(args, cfg):
+    """Semillas independientes y reproducibles por réplica."""
     combos = [(g, T) for g in args.gammas for T in args.T]
     seeds = np.random.SeedSequence(args.seed).spawn(len(combos) * args.reps)
     tasks, k = [], 0
@@ -285,37 +360,65 @@ def main(argv=None):
         for rep in range(args.reps):
             tasks.append((g, T, rep, int(seeds[k].generate_state(1)[0]), cfg))
             k += 1
+    return tasks
 
-    print(f"Monte Carlo DCC-H: {len(combos)} combinaciones × {args.reps} réplicas = {len(tasks)} "
-          f"réplicas, con {args.workers} proceso(s). Resultados en '{args.out}/'.")
+
+def collect(rows, args):
+    df = pd.DataFrame(rows).sort_values(['gamma_true', 'T', 'rep']).reset_index(drop=True)
+    df.attrs['a'], df.attrs['b'] = args.a, args.b
+    return df, summarize(df), error_report(df)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    try:
+        cfg = build_cfg(args)
+    except ValueError as e:
+        sys.exit(str(e))
+    os.makedirs(args.out, exist_ok=True)
+    with open(os.path.join(args.out, 'configuracion.json'), 'w', encoding='utf-8') as f:
+        json.dump({**vars(args), 'cfg': cfg, 'app_importada': A.__file__}, f, indent=2,
+                  ensure_ascii=False)
+    tasks = build_tasks(args, cfg)
+
+    print(f"Monte Carlo DCC-H: {len(tasks)} réplicas ({len(args.gammas)} γ × {len(args.T)} T × "
+          f"{args.reps}), con {args.workers} proceso(s).\nEstimador: {A.__file__}\n"
+          f"Resultados en '{args.out}/'.")
     t_ini = time.time()
-    rows = []
+    rows, first_error_shown = [], False
     step = max(1, len(tasks) // 20)
+
+    def _handle(i, row):
+        nonlocal first_error_shown
+        rows.append(row)
+        if not row.get('ok', False) and not first_error_shown:
+            print(f"  ⚠️ Una réplica falló: {row.get('error')}", flush=True)
+            first_error_shown = True
+        if i % step == 0 or i == len(tasks):
+            _progress(i, len(tasks), t_ini)
+
     if args.workers <= 1:
-        iterator = (run_replica(t) for t in tasks)
-        for i, row in enumerate(iterator, 1):
-            rows.append(row)
-            if i % step == 0 or i == len(tasks):
-                _progress(i, len(tasks), t_ini)
+        for i, t in enumerate(tasks, 1):
+            _handle(i, run_replica(t))
     else:
         with ProcessPoolExecutor(max_workers=args.workers) as ex:
             futures = [ex.submit(run_replica, t) for t in tasks]
             for i, fut in enumerate(as_completed(futures), 1):
-                rows.append(fut.result())
-                if i % step == 0 or i == len(tasks):
-                    _progress(i, len(tasks), t_ini)
+                _handle(i, fut.result())
 
-    df = pd.DataFrame(rows).sort_values(['gamma_true', 'T', 'rep']).reset_index(drop=True)
-    df.attrs['a'], df.attrs['b'] = args.a, args.b
+    df, summ, errs = collect(rows, args)
     df.to_csv(os.path.join(args.out, 'replicas.csv'), index=False)
-    summ = summarize(df)
+    if len(errs):
+        print(f"\n⚠️ {int(errs.sum())} de {len(df)} réplicas fallaron. Errores más frecuentes:")
+        for msg, n in errs.head(5).items():
+            print(f"   {n} ×  {msg}")
+    if summ is None:
+        print("\n❌ Ninguna réplica terminó bien: no hay resumen. Revisá el error de arriba.")
+        return df, None
     summ.to_csv(os.path.join(args.out, 'resumen.csv'), index=False)
     print_summary(summ)
-    n_fail = int((~df['ok']).sum())
-    if n_fail:
-        print(f"\n⚠️ {n_fail} réplica(s) fallaron; ver la columna 'error' en replicas.csv.")
-    print(f"\nTiempo total: {(time.time() - t_ini) / 60:.1f} min. Archivos: replicas.csv, resumen.csv, "
-          f"configuracion.json")
+    print(f"\nTiempo total: {(time.time() - t_ini) / 60:.1f} min. Archivos: replicas.csv, "
+          f"resumen.csv, configuracion.json")
     return df, summ
 
 
@@ -326,5 +429,105 @@ def _progress(i, n, t_ini):
           f"restante ≈ {eta / 60:.1f} min", flush=True)
 
 
+# ============================================================================
+# 🖥️ INTERFAZ STREAMLIT ("streamlit run montecarlo_dcch.py")
+# ============================================================================
+
+def streamlit_main():
+    """
+    Interfaz para correr el Monte Carlo desde el navegador (local o Streamlit
+    Cloud). Corre en un solo proceso: en Streamlit Cloud el paralelismo no
+    ayuda y puede fallar. Para el estudio completo (miles de réplicas) conviene
+    la terminal: python montecarlo_dcch.py
+    """
+    import streamlit as st
+
+    st.title("🎲 Monte Carlo del estimador DCC-H")
+    st.caption(f"Sección 3.9 de la tesis · estimador importado de: {os.path.basename(A.__file__)}")
+    st.info("Corre en un solo proceso (≈1 s por réplica). No cierres ni recargues la pestaña mientras "
+            "corre: Streamlit detiene la ejecución. Para miles de réplicas, usá la terminal.")
+
+    d = parse_args([])
+    max_g = round(0.999 - d.a - d.b - 0.001, 3)
+    c1, c2, c3 = st.columns(3)
+    gammas = c1.multiselect("γ verdaderos", [0.0, 0.01, 0.03, 0.05, 0.07], default=[0.0, 0.03, 0.07],
+                            help=f"Con a={d.a} y b={d.b}, la restricción a+b+γ<1 exige γ ≤ {max_g}.")
+    Ts = c2.multiselect("Largos de ventana T (días)", [126, 252, 504, 1000, 2000],
+                        default=[126, 252, 1000])
+    reps = int(c3.number_input("Réplicas por combinación", min_value=5, max_value=1000, value=30,
+                               step=5))
+    with st.expander("Parámetros avanzados (DGP y especificación)"):
+        a1, a2, a3, a4 = st.columns(4)
+        hist = int(a1.number_input("Historia previa (días)", 300, 2000, d.hist, 1))
+        a_p = float(a2.number_input("a verdadero", 0.0, 0.3, d.a, 0.01, format="%.3f"))
+        b_p = float(a3.number_input("b verdadero", 0.3, 0.99, d.b, 0.01, format="%.3f"))
+        nu = float(a4.number_input("ν de la t (0 = normal)", 0.0, 30.0, d.nu, 1.0))
+        a5, a6, a7, a8 = st.columns(4)
+        rho_bar = float(a5.number_input("ρ̄ (Q̄)", 0.0, 0.9, d.rho_bar, 0.05))
+        rho_s = float(a6.number_input("ρ_S (Q^(S))", 0.0, 0.95, d.rho_s, 0.05))
+        alpha = float(a7.number_input("α Gumbel", 0.90, 0.99, d.alpha, 0.005, format="%.3f"))
+        kappa = float(a8.number_input("κ", 0.15, 0.6, d.kappa, 0.05))
+        a9, a10, _, _ = st.columns(4)
+        min_obs = int(a9.number_input("Mínimo días de estrés Q^(S)", 5, 60, d.min_obs, 1))
+        seed = int(a10.number_input("Semilla", 0, 2**31 - 1, d.seed, 1))
+
+    n_tot = len(gammas) * len(Ts) * reps
+    st.caption(f"Total: {n_tot} réplicas · tiempo estimado ≈ {max(1, round(n_tot * 0.9 / 60))} min.")
+
+    if st.button("▶️ Ejecutar Monte Carlo", type="primary", disabled=(n_tot == 0)):
+        argv = ['--gammas', *map(str, gammas), '--T', *map(str, Ts), '--reps', str(reps),
+                '--hist', str(hist), '--a', str(a_p), '--b', str(b_p), '--nu', str(nu),
+                '--rho-bar', str(rho_bar), '--rho-s', str(rho_s), '--alpha', str(alpha),
+                '--kappa', str(kappa), '--min-obs', str(min_obs), '--seed', str(seed),
+                '--workers', '1']
+        args = parse_args(argv)
+        try:
+            cfg = build_cfg(args)
+        except ValueError as e:
+            st.error(str(e))
+            st.stop()
+        tasks = build_tasks(args, cfg)
+        bar, status = st.progress(0.0), st.empty()
+        rows, t_ini, shown = [], time.time(), False
+        for i, t in enumerate(tasks, 1):
+            row = run_replica(t)
+            rows.append(row)
+            if not row.get('ok', False) and not shown:
+                st.error(f"Una réplica falló: {row.get('error')}")
+                shown = True
+            el = time.time() - t_ini
+            bar.progress(i / len(tasks))
+            status.caption(f"{i}/{len(tasks)} réplicas — {el / 60:.1f} min transcurridos, "
+                           f"≈ {el / i * (len(tasks) - i) / 60:.1f} min restantes")
+        df, summ, errs = collect(rows, args)
+        st.session_state['mc'] = {'df': df, 'summ': summ, 'errs': errs,
+                                  'config': {**vars(args), 'cfg': cfg,
+                                             'app_importada': os.path.basename(A.__file__)},
+                                  'minutos': (time.time() - t_ini) / 60}
+
+    mc = st.session_state.get('mc')
+    if not mc:
+        return
+    st.markdown("---")
+    st.subheader("Resultados")
+    st.caption(f"Tiempo: {mc['minutos']:.1f} min · {len(mc['df'])} réplicas")
+    if len(mc['errs']):
+        st.warning(f"{int(mc['errs'].sum())} réplica(s) fallaron. Errores más frecuentes:")
+        st.dataframe(mc['errs'].rename('réplicas').to_frame(), use_container_width=True)
+    if mc['summ'] is None:
+        st.error("Ninguna réplica terminó bien, así que no hay resumen. El error de arriba indica la causa.")
+    else:
+        st.text("\n".join(summary_lines(mc['summ'])).strip())
+        st.dataframe(mc['summ'].round(4), use_container_width=True)
+        st.download_button("📥 resumen.csv", mc['summ'].to_csv(index=False), "resumen.csv", "text/csv")
+    st.download_button("📥 replicas.csv", mc['df'].to_csv(index=False), "replicas.csv", "text/csv")
+    st.download_button("📥 configuracion.json",
+                       json.dumps(mc['config'], indent=2, ensure_ascii=False, default=str),
+                       "configuracion.json", "application/json")
+
+
 if __name__ == "__main__":   # necesario para el paralelismo en Windows
-    main()
+    if _running_in_streamlit():
+        streamlit_main()
+    else:
+        main()
