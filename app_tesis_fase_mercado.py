@@ -2,7 +2,7 @@
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
 # Archivo: app_tesis.py
-# Versión: 2.2 — definición de tensión 'sorpresa' vs 'estado' (septiembre 2026)
+# Versión: 2.3 — fechas sin límite de 10 años y clasificador según potencia (septiembre 2026)
 # Ejecutar: streamlit run app_tesis.py
 #
 # CAMBIOS RESPECTO DE LA VERSIÓN ANTERIOR (el detalle está en cada función):
@@ -37,6 +37,13 @@
 #      concluyente". Aviso si la ventana es demasiado larga para una fase.
 # [16] v2.2: tablas sin "None", nombre para períodos personalizados, preset
 #      P6 (2022–hoy) y portafolio base con historia larga (^GDAXI, DX-Y.NYB).
+# [17] v2.3: el selector de fechas "Personalizado" permitía ir solo 10 años
+#      hacia atrás (límite por defecto de st.date_input); ahora desde 1990.
+# [18] v2.3: con γ no significativo, la Fase 4 exige al menos
+#      MIN_INFORMATIVOS_POTENCIA días informativos; con menos, el resultado
+#      es "sin evidencia concluyente" (el Monte Carlo mostró potencia ≈0 con
+#      12–20 días informativos). La Fase 3 se mantiene (VaR fallido y tensión
+#      alta son observables), con una advertencia sobre γ.
 # ============================================================================
 
 import streamlit as st
@@ -68,6 +75,12 @@ PENALTY = -1e10               # [2] log-verosimilitud de región inválida
 ALPHA_TEST = 0.05             # nivel de significancia de los tests
 UMBRAL_H_BAJO = 2.0           # % de días con H_t=1 (clasificador de fases)
 UMBRAL_H_ALTO = 10.0
+# [18] PROVISIONAL: días informativos mínimos para interpretar un γ NO
+# significativo como "corrección no sistemática" (Fase 4). El Monte Carlo
+# con T=1000 (~12 días informativos) dio potencia ≈0 para γ ≤ 0.07. Ajustar
+# este valor cuando el Monte Carlo indique con cuántos días la potencia es
+# aceptable (p. ej. ≥ 80%).
+MIN_INFORMATIVOS_POTENCIA = 60
 DCC_H_BOUNDS = [(1e-6, 0.3), (0.5, 0.998), (0.0, 0.3)]   # a, b, γ
 DCC_STATIONARITY = 0.998      # a + b + γ <= 0.998
 
@@ -95,7 +108,7 @@ def _fase(fase, subfase, color, descripcion, caracteristicas, recomendaciones, n
 
 
 def clasificar_fase(lr_pvalue, kupiec_pvalue, dias_ht_percentage, gamma_identificado=True,
-                    n_informativos=None, min_informativos=10,
+                    n_informativos=None, min_informativos=MIN_INFORMATIVOS_POTENCIA,
                     umbral_bajo=UMBRAL_H_BAJO, umbral_alto=UMBRAL_H_ALTO, alpha_test=ALPHA_TEST):
     """
     Clasifica la fase del mercado. CORRECCIÓN [11]: la versión anterior tenía
@@ -1320,8 +1333,11 @@ def sidebar_config():
     regime = st.sidebar.selectbox("Ventana de análisis", list(PRESETS.keys()))
     if PRESETS[regime] is None:
         c1, c2 = st.sidebar.columns(2)
-        start = c1.date_input("Inicio", value=date(2020, 1, 1))
-        end = c2.date_input("Fin", value=date.today())
+        # [17] min_value explícito: por defecto Streamlit solo permite 10 años hacia atrás
+        start = c1.date_input("Inicio", value=date(2020, 1, 1), min_value=date(1990, 1, 1),
+                              max_value=date.today())
+        end = c2.date_input("Fin", value=date.today(), min_value=date(1990, 1, 1),
+                            max_value=date.today())
         nombre = st.sidebar.text_input("Nombre del período (para la comparativa)", value="")
         regime = nombre.strip() or f"Personalizado ({start:%Y-%m} a {end:%Y-%m})"
     else:
