@@ -2,7 +2,7 @@
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
 # Archivo: app_tesis.py
-# Versión: 2.3 — fechas sin límite de 10 años y clasificador según potencia (septiembre 2026)
+# Versión: 2.4 — bootstrap paramétrico del test LR (septiembre 2026)
 # Ejecutar: streamlit run app_tesis.py
 #
 # CAMBIOS RESPECTO DE LA VERSIÓN ANTERIOR (el detalle está en cada función):
@@ -44,8 +44,12 @@
 #      es "sin evidencia concluyente" (el Monte Carlo mostró potencia ≈0 con
 #      12–20 días informativos). La Fase 3 se mantiene (VaR fallido y tensión
 #      alta son observables), con una advertencia sobre γ.
+# [19] v2.4: GARCH vectorizado (idéntico, ~14x más rápido).
+# [20] v2.4: bootstrap paramétrico del test LR bajo H0: γ=0 (Sección 3.6.1),
+#      que reestima ambas etapas en cada réplica.
 # ============================================================================
 
+import time
 import streamlit as st
 import yfinance as yf
 import numpy as np
@@ -307,13 +311,21 @@ def calculate_returns(prices):
 # 📈 GARCH(1,1) UNIVARIADO POR MLE, POR ACTIVO (Sección 3.2.3)
 # ============================================================================
 
+def _garch11_sigma2(omega, alpha, beta, r, sigma2_0):
+    """
+    σ²_t = ω + α r²_{t−1} + β σ²_{t−1}, con σ²_0 dado. [19] Es una recursión
+    lineal, así que se calcula con un filtro IIR (idéntico al bucle, ~50x más
+    rápido); esto hace viable reestimar el GARCH en cada réplica del bootstrap.
+    """
+    x = np.empty(len(r))
+    x[0] = sigma2_0
+    x[1:] = omega + alpha * r[:-1] ** 2
+    return lfilter([1.0], [1.0, -beta], x)
+
+
 def _garch11_neg_loglik(theta, r):
     omega, alpha, beta = theta
-    n = len(r)
-    sigma2 = np.empty(n)
-    sigma2[0] = np.var(r) if np.var(r) > 1e-12 else 1e-6
-    for t in range(1, n):
-        sigma2[t] = omega + alpha * r[t-1] ** 2 + beta * sigma2[t-1]
+    sigma2 = _garch11_sigma2(omega, alpha, beta, r, np.var(r) if np.var(r) > 1e-12 else 1e-6)
     sigma2 = np.clip(sigma2, 1e-12, None)
     ll = -0.5 * np.sum(np.log(2 * np.pi) + np.log(sigma2) + r ** 2 / sigma2)
     if not np.isfinite(ll):
@@ -357,11 +369,7 @@ def fit_garch11_mle(r):
         converged = bool(best_res.success)
         loglik = -best_res.fun
 
-    n = len(r)
-    sigma2 = np.empty(n)
-    sigma2[0] = np.var(r) if np.var(r) > 1e-12 else 1e-6
-    for t in range(1, n):
-        sigma2[t] = omega + alpha * r[t-1] ** 2 + beta * sigma2[t-1]
+    sigma2 = _garch11_sigma2(omega, alpha, beta, r, np.var(r) if np.var(r) > 1e-12 else 1e-6)
     sigma = np.sqrt(np.clip(sigma2, 1e-12, None))
 
     return {'omega': float(omega), 'alpha': float(alpha), 'beta': float(beta),
@@ -961,6 +969,102 @@ def run_robustness_panel(z_std, stress_series, loc_df, scale_df, Q_bar, t0, t_st
 
 
 # ============================================================================
+# 🔁 BOOTSTRAP PARAMÉTRICO DEL TEST LR  [20]  (Sección 3.6.1)
+# ============================================================================
+#
+# Pregunta que responde: si γ fuera 0, ¿con qué frecuencia el procedimiento
+# COMPLETO (GARCH → tensión → Q^(S) → LR) produciría un LR tan grande como el
+# observado en estos datos? Evita depender de la aproximación asintótica
+# ½χ²(0)+½χ²(1), que puede fallar con pocos días informativos, con residuos
+# de colas pesadas y con estimación en dos etapas.
+#
+# Diseño (bootstrap paramétrico bajo H0 con innovaciones empíricas):
+#   1. Se toman los parámetros estimados en los datos reales bajo H0:
+#      GARCH(1,1) de cada activo, Q̄ y (a, b) del DCC restringido (γ = 0).
+#   2. Innovaciones: e_t = L_t⁻¹ z_t, con L_t la factorización de Cholesky de
+#      la R_t del DCC restringido, blanqueadas para que tengan covarianza
+#      identidad. Se remuestrean filas completas con reposición: se conservan
+#      las colas pesadas y la dependencia contemporánea de las colas.
+#   3. Se simula la muestra completa (historia previa + ventana) con γ = 0.
+#   4. Sobre cada muestra simulada se repite exactamente el procedimiento de
+#      la app: se REESTIMA el GARCH (opcional), se recalcula H_t con la misma
+#      definición de tensión, Q^(S) y el test LR con la misma verosimilitud.
+#   5. p_bootstrap = (1 + #{LR* >= LR_obs}) / (B + 1)   (Davison & Hinkley, 1997)
+#      Las réplicas sin días informativos cuentan como LR* = 0, que es lo que
+#      el procedimiento produce en ese caso.
+# ============================================================================
+
+def whitened_innovations(z, R_t):
+    """Innovaciones e_t = L_t⁻¹ z_t, centradas y blanqueadas (covarianza identidad)."""
+    L = np.linalg.cholesky(R_t)
+    E = np.linalg.solve(L, z[:, :, None])[:, :, 0]
+    E = E - E.mean(axis=0)
+    Lc = np.linalg.cholesky(np.cov(E.T, bias=True))
+    return E @ np.linalg.inv(Lc).T
+
+
+def simulate_restricted(rng, E, n_total, a, b, Q_bar, omega, alpha, beta, sigma2_0):
+    """Simula (z, r) de longitud n_total desde el DCC restringido (γ=0) + GARCH por activo."""
+    N = Q_bar.shape[0]
+    idx = rng.integers(0, len(E), n_total)
+    Z = np.empty((n_total, N))
+    r = np.empty((n_total, N))
+    Q_prev, s2, w = Q_bar, np.asarray(sigma2_0, dtype=float).copy(), 1 - a - b
+    for t in range(n_total):
+        if t == 0:
+            Q = Q_bar
+        else:
+            Q = w * Q_bar + a * np.outer(Z[t - 1], Z[t - 1]) + b * Q_prev
+            s2 = omega + alpha * r[t - 1] ** 2 + beta * s2
+        d = np.sqrt(np.diag(Q))
+        Z[t] = np.linalg.cholesky(Q / np.outer(d, d)) @ E[idx[t]]
+        r[t] = np.sqrt(s2) * Z[t]
+        Q_prev = Q
+    return Z, r
+
+
+def bootstrap_context(res, cfg, reestimar_garch=True):
+    """Todo lo necesario para simular bajo H0, extraído de una corrida de la app."""
+    gdf = res['garch_df'].set_index('Ticker').loc[res['tickers']]
+    a_r, b_r = [float(x) for x in res['lr']['params_restricted'][:2]]
+    return {
+        'E': whitened_innovations(res['z_std'].values, res['R_s']),
+        'a': a_r, 'b': b_r, 'Q_bar': res['Q_bar'],
+        'omega': gdf['omega'].values.astype(float), 'alpha': gdf['alpha'].values.astype(float),
+        'beta': gdf['beta'].values.astype(float),
+        'sigma2_0': res['sigma'][0] ** 2,
+        'index': res['returns'].index, 'columns': list(res['returns'].columns),
+        't_start': res['t_start'], 'cfg': dict(cfg), 'reestimar_garch': reestimar_garch,
+    }
+
+
+def bootstrap_replica(seed, ctx):
+    """Una réplica bajo H0: simula y aplica el procedimiento completo de la app."""
+    rng = np.random.default_rng(seed)
+    n = len(ctx['index'])
+    Zs, rs = simulate_restricted(rng, ctx['E'], n, ctx['a'], ctx['b'], ctx['Q_bar'],
+                                 ctx['omega'], ctx['alpha'], ctx['beta'], ctx['sigma2_0'])
+    ret = pd.DataFrame(rs, index=ctx['index'], columns=ctx['columns'])
+    if ctx['reestimar_garch']:
+        z_df, _, _, _ = garch_filter(ret)
+    else:
+        z_df = pd.DataFrame(Zs, index=ctx['index'], columns=ctx['columns'])
+    Q_bar_h = ensure_positive_definite(np.corrcoef(z_df.values.T), min_eig=1e-6)
+    _, _, _, _, H, _, Qs, active, _ = _stress_block(z_df, ret, ctx['cfg'], Q_bar_h)
+    lr = likelihood_ratio_test(z_df.values, H.values, Q_bar_h, Qs, active, ctx['t_start'],
+                               compute_se=False)
+    return {'seed': seed, 'identificado': bool(lr['identificado']),
+            'dias_informativos': int(lr['n_informativos']),
+            'LR': float(lr['lr_statistic']) if lr['identificado'] else 0.0,
+            'gamma_hat': float(lr['params_unrestricted'][2])}
+
+
+def bootstrap_pvalue(lr_obs, lr_boot):
+    lr_boot = np.asarray(lr_boot, dtype=float)
+    return (1 + np.sum(lr_boot >= lr_obs - 1e-12)) / (len(lr_boot) + 1)
+
+
+# ============================================================================
 # ⚠️ VaR Y BACKTESTING
 # ============================================================================
 
@@ -1417,6 +1521,94 @@ def _fmt(x, f='{:.4f}'):
     return '—' if x is None or (isinstance(x, float) and not np.isfinite(x)) else f.format(x)
 
 
+def render_bootstrap(res, cfg, run_key):
+    """Interfaz del bootstrap paramétrico del test LR (Sección 3.6.1) [20]."""
+    lr = res['lr']
+    with st.expander("🔁 Bootstrap paramétrico del test LR (Sección 3.6.1)", expanded=True):
+        st.caption(
+            "Simula muestras completas bajo H0 (γ = 0) con los parámetros estimados en TUS datos "
+            "(GARCH de cada activo, Q̄, a y b del DCC restringido) y remuestreo de las innovaciones "
+            "empíricas. En cada réplica repite el procedimiento completo (GARCH → tensión → Q^(S) → "
+            "LR). El p-value bootstrap es la proporción de réplicas con un LR al menos tan grande "
+            "como el observado: no depende de la aproximación asintótica ½χ²(0)+½χ²(1).")
+        c1, c2, c3 = st.columns(3)
+        B = int(c1.selectbox("Réplicas (B)", [49, 99, 199, 499], index=2, key="boot_B",
+                             help="199 da un p-value mínimo de 0,005; 499 es más preciso pero tarda "
+                                  "más del doble."))
+        reest = c2.checkbox("Reestimar el GARCH en cada réplica", value=True, key="boot_reest",
+                            help="Recomendado: incorpora la incertidumbre de la Etapa 1.")
+        seed = int(c3.number_input("Semilla", 0, 2**31 - 1, 20260923, key="boot_seed"))
+        seg = B * 0.75 * len(res['returns']) / 1000
+        st.caption(f"Tiempo estimado ≈ {max(1, round(seg / 60))}–{max(1, round(1.5 * seg / 60))} min. "
+                   "No cierres ni recargues la pestaña mientras corre.")
+        boot_key = f"boot::{run_key}::{B}::{reest}::{seed}"
+
+        if st.button("▶️ Ejecutar bootstrap", key="boot_btn"):
+            ctx = bootstrap_context(res, cfg, reestimar_garch=reest)
+            seeds = np.random.SeedSequence(seed).generate_state(B)
+            bar, status = st.progress(0.0), st.empty()
+            rows, t_ini = [], time.time()
+            for i, sd in enumerate(seeds, 1):
+                try:
+                    rows.append(bootstrap_replica(int(sd), ctx))
+                except Exception as e:
+                    rows.append({'seed': int(sd), 'error': f"{type(e).__name__}: {e}"})
+                el = time.time() - t_ini
+                bar.progress(i / B)
+                status.caption(f"{i}/{B} réplicas — {el / 60:.1f} min, ≈ {el / i * (B - i) / 60:.1f} min restantes")
+            st.session_state[boot_key] = pd.DataFrame(rows)
+
+        if boot_key not in st.session_state:
+            return
+        bdf = st.session_state[boot_key]
+        ok = bdf[bdf['error'].isna()] if 'error' in bdf.columns else bdf
+        n_fail = len(bdf) - len(ok)
+        if len(ok) == 0:
+            st.error(f"Todas las réplicas fallaron. Primer error: {bdf['error'].dropna().iloc[0]}")
+            return
+        LRb = ok['LR'].values.astype(float)
+        lr_obs = float(lr['lr_statistic'])
+        p_boot = bootstrap_pvalue(lr_obs, LRb)
+        crit95 = float(np.quantile(LRb, 0.95))
+        st.session_state[f"boot_p::{run_key}"] = (p_boot, len(ok))
+
+        c = st.columns(4)
+        c[0].metric("p-value bootstrap", f"{p_boot:.4f}")
+        c[1].metric("p-value asintótico", f"{lr['p_value']:.4f}")
+        c[2].metric("LR observado", f"{lr_obs:.3f}")
+        c[3].metric("Valor crítico bootstrap (5%)", f"{crit95:.3f}",
+                    help="Percentil 95 de los LR simulados bajo H0 (el asintótico es 2,71).")
+        if n_fail:
+            st.warning(f"{n_fail} réplica(s) fallaron y se excluyeron. Primer error: "
+                       f"{bdf['error'].dropna().iloc[0]}")
+
+        fig = go.Figure()
+        fig.add_trace(go.Histogram(x=LRb, nbinsx=40, name='LR* bajo H0', marker_color='#7f7f7f'))
+        fig.add_vline(x=lr_obs, line_color='#d62728', line_width=3,
+                      annotation_text=f"LR observado = {lr_obs:.2f}")
+        fig.update_layout(title="Distribución bootstrap del LR bajo H0: γ = 0",
+                          xaxis_title="LR", yaxis_title="Réplicas", height=350, showlegend=False)
+        st.plotly_chart(fig, use_container_width=True)
+
+        st.caption(f"{len(ok)} réplicas válidas · γ identificado en {ok['identificado'].mean():.0%} · "
+                   f"LR* > 0 en {np.mean(LRb > 1e-8):.0%} · γ̂* medio bajo H0 = "
+                   f"{ok['gamma_hat'].mean():.4f} (γ̂ observado = {lr['params_unrestricted'][2]:.4f}) · "
+                   f"resolución: el p-value mínimo posible es {1 / (len(ok) + 1):.4f}")
+        if p_boot < 0.05:
+            st.success(f"Un LR como el observado aparece en menos del 5% de las muestras simuladas sin "
+                       f"efecto homeostático (p = {p_boot:.4f}): evidencia a favor de γ > 0 con esta "
+                       "especificación. Documentar en la tesis cuándo y por qué se eligió la definición "
+                       "de tensión usada.")
+        elif p_boot < 0.10:
+            st.info(f"Evidencia débil (p = {p_boot:.4f}): significativo al 10% pero no al 5%.")
+        else:
+            st.warning(f"Un LR como el observado es frecuente sin efecto homeostático (p = {p_boot:.4f}): "
+                       "los datos son compatibles con γ = 0.")
+        st.download_button("📥 Réplicas del bootstrap (CSV)", bdf.to_csv(index=False),
+                           file_name=f"bootstrap_lr_{datetime.now():%Y%m%d}.csv", mime="text/csv",
+                           key="boot_dl")
+
+
 def render_results(res, cfg, regime, run_key):
     returns, t0, tickers = res['returns'], res['t0'], res['tickers']
     dates = returns.index[t0:]
@@ -1583,6 +1775,10 @@ def render_results(res, cfg, regime, run_key):
                        "Es un resultado informativo en sí mismo. Si después de verlo se cambian α o κ, "
                        "el cambio debe declararse y corregirse por comparaciones múltiples (5b).")
 
+    # ---------------------------------------------------------------- 5c. Bootstrap [20]
+    if lr['identificado']:
+        render_bootstrap(res, cfg, run_key)
+
     n_lik = lr['n_obs_lik']
     k_u = 3 if lr['identificado'] else 2
     comp = pd.DataFrame({
@@ -1727,7 +1923,15 @@ def render_results(res, cfg, regime, run_key):
             'Días informativos γ': lr['n_informativos'], 'γ': round(float(g_h), 4),
             'LR p corregido': lr['p_value'], 'Kupiec p': round(bt['kupiec_pvalue'], 4),
             'Fase': fase_info['fase']}
+    boot_p = st.session_state.get(f"boot_p::{run_key}")
+    if boot_p is not None:
+        hist[run_key]['LR p bootstrap'] = boot_p[0]
+        hist[run_key]['B bootstrap'] = boot_p[1]
     hist_df = pd.DataFrame(list(hist.values()))
+    if 'LR p bootstrap' in hist_df.columns:
+        hist_df['LR p bootstrap'] = hist_df['LR p bootstrap'].map(
+            lambda v: '—' if pd.isna(v) else f"{v:.4f}")
+        hist_df['B bootstrap'] = hist_df['B bootstrap'].map(lambda v: '—' if pd.isna(v) else int(v))
     st.dataframe(_fmt_df(hist_df, {'LR p corregido': '{:.6f}', 'γ': '{:.4f}', '% H_t': '{:.2f}',
                                    'α Gumbel': '{:.3f}', 'κ': '{:.2f}', 'Kupiec p': '{:.4f}'},
                          na_rep='no identificado'),
@@ -1824,4 +2028,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
