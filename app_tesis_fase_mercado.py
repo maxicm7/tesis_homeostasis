@@ -2,7 +2,7 @@
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
 # Archivo: app_tesis.py
-# Versión: 2.4 — bootstrap paramétrico del test LR (septiembre 2026)
+# Versión: 2.6 — bootstrap de robustez con corrección de Romano-Wolf (septiembre 2026)
 # Ejecutar: streamlit run app_tesis.py
 #
 # CAMBIOS RESPECTO DE LA VERSIÓN ANTERIOR (el detalle está en cada función):
@@ -47,6 +47,14 @@
 # [19] v2.4: GARCH vectorizado (idéntico, ~14x más rápido).
 # [20] v2.4: bootstrap paramétrico del test LR bajo H0: γ=0 (Sección 3.6.1),
 #      que reestima ambas etapas en cada réplica.
+# [21] v2.5: el bootstrap guarda cada réplica al terminarla; si la ejecución
+#      se interrumpe (un clic en la página, la pestaña suspendida), al volver
+#      a presionar el botón continúa desde donde quedó.
+# [22] v2.6: el panel de robustez descarta especificaciones equivalentes (con
+#      N activos, dos κ que exigen la misma cantidad de activos en tensión dan
+#      exactamente el mismo H_t y no deben contarse dos veces en la corrección).
+# [23] v2.6: bootstrap de robustez con corrección de Romano-Wolf (stepdown
+#      sobre el máximo LR), que respeta la correlación entre especificaciones.
 # ============================================================================
 
 import time
@@ -930,6 +938,26 @@ def benjamini_hochberg(pvalues, alpha=0.05):
     return {'adjusted_pvalues': adj_p, 'significant': significant, 'cutoff': float(cutoff)}
 
 
+def distinct_specs(alpha_grid, kappa_grid, N):
+    """
+    [22] Especificaciones (α, κ) DISTINTAS. Como H_t=1 si (activos en tensión)/N >= κ,
+    lo que importa es k = ⌈κ·N⌉: con N=6, κ=0.20 y κ=0.30 exigen ambos ≥2 activos y
+    producen exactamente el mismo H_t. Devuelve ([(α, κ, k), ...], [(α, κ) descartados]).
+    """
+    specs, seen, dup = [], set(), []
+    for a in sorted(set(float(x) for x in alpha_grid)):
+        # De mayor a menor: entre κ equivalentes se conserva el mayor (p. ej. 0.30 y no 0.20)
+        for k in sorted(set(float(x) for x in kappa_grid), reverse=True):
+            cnt = int(np.ceil(k * N - 1e-9))
+            if (a, cnt) in seen:
+                dup.append((a, k))
+                continue
+            seen.add((a, cnt))
+            specs.append((a, k, cnt))
+    specs.sort(key=lambda x: (x[0], x[1]))
+    return specs, dup
+
+
 def run_robustness_panel(z_std, stress_series, loc_df, scale_df, Q_bar, t0, t_start, alpha_grid,
                          kappa_grid, min_obs=30):
     """
@@ -939,22 +967,25 @@ def run_robustness_panel(z_std, stress_series, loc_df, scale_df, Q_bar, t0, t_st
     """
     Z = z_std.values
     rows = []
-    for a_g in alpha_grid:
-        ind = stress_indicators(stress_series, gumbel_thresholds(loc_df, scale_df, a_g))
-        for k_g in kappa_grid:
-            H_g, _ = calculate_systemic_indicator(ind, k_g)
-            Hv = H_g.values
-            Qs_g, act_g = compute_recursive_Qstress(Z, Hv, Q_bar, min_obs)
-            lr = likelihood_ratio_test(Z, Hv, Q_bar, Qs_g, act_g, t_start, compute_se=False)
-            rows.append({
-                'alpha_gumbel': a_g, 'kappa': k_g,
-                'dias_Ht_ventana': int(Hv[t0:].sum()),
-                'pct_Ht_ventana': float(Hv[t0:].mean() * 100),
-                'dias_informativos': lr['n_informativos'],
-                'LR_stat': lr['lr_statistic'],
-                'p_value_corregido': lr['p_value'],
-                'gamma': float(lr['params_unrestricted'][2]),
-            })
+    specs, dup = distinct_specs(alpha_grid, kappa_grid, Z.shape[1])
+    ind_cache = {}
+    for a_g, k_g, cnt in specs:
+        if a_g not in ind_cache:
+            ind_cache[a_g] = stress_indicators(stress_series, gumbel_thresholds(loc_df, scale_df, a_g))
+        ind = ind_cache[a_g]
+        H_g, _ = calculate_systemic_indicator(ind, k_g)
+        Hv = H_g.values
+        Qs_g, act_g = compute_recursive_Qstress(Z, Hv, Q_bar, min_obs)
+        lr = likelihood_ratio_test(Z, Hv, Q_bar, Qs_g, act_g, t_start, compute_se=False)
+        rows.append({
+            'alpha_gumbel': a_g, 'kappa': k_g, 'activos_en_tension_min': cnt,
+            'dias_Ht_ventana': int(Hv[t0:].sum()),
+            'pct_Ht_ventana': float(Hv[t0:].mean() * 100),
+            'dias_informativos': lr['n_informativos'],
+            'LR_stat': lr['lr_statistic'],
+            'p_value_corregido': lr['p_value'],
+            'gamma': float(lr['params_unrestricted'][2]),
+        })
     df = pd.DataFrame(rows)
     df['p_value_ajustado_BH'] = np.nan
     df['significativo_BH'] = False
@@ -965,6 +996,7 @@ def run_robustness_panel(z_std, stress_series, loc_df, scale_df, Q_bar, t0, t_st
         df.loc[ident, 'significativo_BH'] = bh['significant']
     df['n_especificaciones_evaluadas'] = len(df)
     df['n_especificaciones_identificadas'] = int(ident.sum())
+    df.attrs['descartadas'] = dup
     return df
 
 
@@ -1062,6 +1094,93 @@ def bootstrap_replica(seed, ctx):
 def bootstrap_pvalue(lr_obs, lr_boot):
     lr_boot = np.asarray(lr_boot, dtype=float)
     return (1 + np.sum(lr_boot >= lr_obs - 1e-12)) / (len(lr_boot) + 1)
+
+
+# ============================================================================
+# 🔁 BOOTSTRAP DE ROBUSTEZ CON CORRECCIÓN DE ROMANO-WOLF  [23]
+# ============================================================================
+#
+# Pregunta: considerando TODAS las especificaciones (α, κ) evaluadas, ¿cuáles
+# rechazan H0: γ=0 controlando la probabilidad de cometer AL MENOS UN falso
+# positivo (FWER)? A diferencia de Bonferroni o Benjamini-Hochberg, Romano-Wolf
+# usa la distribución CONJUNTA de los LR bajo H0 (todas las especificaciones
+# se evalúan sobre la misma muestra simulada), así que no penaliza de más
+# cuando las especificaciones comparten la mayoría de los días de tensión.
+#
+# Algoritmo (Romano & Wolf, 2005; stepdown sobre el máximo, estadístico LR):
+#   1. Ordenar las especificaciones por LR observado, de mayor a menor.
+#   2. Para la j-ésima: p_RW = (1 + #{b : max_{i en las restantes} LR*_{b,i} ≥ LR_obs,j})/(B+1)
+#   3. Imponer monotonía: p_RW(j) = max(p_RW(j), p_RW(j-1)).
+# Además se reportan los p-values bootstrap individuales, sin corrección.
+#
+# Bajo H0 (γ=0) el DGP no depende de H_t, así que es el mismo para todas las
+# especificaciones, y el DCC restringido se estima una sola vez por muestra.
+# ============================================================================
+
+def multi_spec_lr(z_df, stress_series, Q_bar, cfg, specs, t_start):
+    """LR de varias especificaciones (α, κ) sobre los MISMOS datos."""
+    Z = z_df.values
+    T = len(Z)
+    loc, scale = gumbel_rolling_params(stress_series, cfg['gumbel_window'], cfg['block_size'],
+                                       cfg['gumbel_method'],
+                                       expanding=(cfg['threshold_window'] == 'expansiva'))
+    # El DCC restringido (γ=0) no usa H_t ni Q^(S): se estima una vez.
+    H0 = np.zeros(T, dtype=int)
+    Qs0 = np.broadcast_to(Q_bar, (T,) + Q_bar.shape)
+    res_r = estimate_dcc_parameters(Z, H0, Q_bar, Qs0, 'DCC', t_start)
+    ll_r = -res_r.fun
+    out, ind_cache = [], {}
+    for a_g, k_g, cnt in specs:
+        if a_g not in ind_cache:
+            ind_cache[a_g] = stress_indicators(stress_series, gumbel_thresholds(loc, scale, a_g))
+        H, _ = calculate_systemic_indicator(ind_cache[a_g], k_g)
+        Hv = H.values
+        Qs, act = compute_recursive_Qstress(Z, Hv, Q_bar, cfg['min_obs_qs'])
+        n_inf = count_informative_days(Hv, act, t_start)
+        if n_inf == 0:
+            out.append({'LR': 0.0, 'n_inf': 0, 'gamma': 0.0, 'identificado': False})
+            continue
+        res_u = estimate_dcc_parameters(Z, Hv, Q_bar, Qs, 'DCC-H', t_start, restricted_params=res_r.x)
+        out.append({'LR': max(0.0, 2 * (-res_u.fun - ll_r)), 'n_inf': n_inf,
+                    'gamma': float(res_u.x[2]), 'identificado': True})
+    return out
+
+
+def romano_wolf_replica(seed, ctx, specs):
+    """Una réplica bajo H0: simula una muestra y calcula el LR de TODAS las especificaciones."""
+    rng = np.random.default_rng(seed)
+    n = len(ctx['index'])
+    Zs, rs = simulate_restricted(rng, ctx['E'], n, ctx['a'], ctx['b'], ctx['Q_bar'],
+                                 ctx['omega'], ctx['alpha'], ctx['beta'], ctx['sigma2_0'])
+    ret = pd.DataFrame(rs, index=ctx['index'], columns=ctx['columns'])
+    if ctx['reestimar_garch']:
+        z_df, _, _, _ = garch_filter(ret)
+    else:
+        z_df = pd.DataFrame(Zs, index=ctx['index'], columns=ctx['columns'])
+    Q_bar_h = ensure_positive_definite(np.corrcoef(z_df.values.T), min_eig=1e-6)
+    X = ret.loc[z_df.index] if ctx['cfg']['stress_base'] == 'retornos' else z_df
+    res = multi_spec_lr(z_df, X, Q_bar_h, ctx['cfg'], specs, ctx['t_start'])
+    row = {'seed': seed}
+    for i, r in enumerate(res):
+        row[f'LR_{i}'] = r['LR']
+    return row
+
+
+def romano_wolf_pvalues(lr_obs, LRb):
+    """p-values bootstrap individuales y ajustados por Romano-Wolf (stepdown, máximo LR)."""
+    lr_obs = np.asarray(lr_obs, dtype=float)
+    LRb = np.asarray(LRb, dtype=float)
+    B, S = LRb.shape
+    p_ind = (1 + (LRb >= lr_obs - 1e-12).sum(axis=0)) / (B + 1)
+    order = np.argsort(-lr_obs)
+    p_rw = np.empty(S)
+    prev = 0.0
+    for step, j in enumerate(order):
+        mx = LRb[:, order[step:]].max(axis=1)
+        p = (1 + np.sum(mx >= lr_obs[j] - 1e-12)) / (B + 1)
+        prev = max(prev, p)
+        p_rw[j] = prev
+    return p_ind, p_rw
 
 
 # ============================================================================
@@ -1543,20 +1662,33 @@ def render_bootstrap(res, cfg, run_key):
                    "No cierres ni recargues la pestaña mientras corre.")
         boot_key = f"boot::{run_key}::{B}::{reest}::{seed}"
 
+        part_key = boot_key + "::parcial"
+        parcial = st.session_state.get(part_key)
+        if parcial and boot_key not in st.session_state:
+            st.info(f"⏸️ Hay {len(parcial)} de {B} réplicas ya calculadas de una ejecución interrumpida. "
+                    "Presioná *Ejecutar bootstrap* para continuar desde ahí.")
+
         if st.button("▶️ Ejecutar bootstrap", key="boot_btn"):
             ctx = bootstrap_context(res, cfg, reestimar_garch=reest)
             seeds = np.random.SeedSequence(seed).generate_state(B)
-            bar, status = st.progress(0.0), st.empty()
-            rows, t_ini = [], time.time()
-            for i, sd in enumerate(seeds, 1):
+            # [21] La lista vive en session_state: cada réplica terminada queda guardada
+            # aunque Streamlit interrumpa el script, y el próximo clic continúa.
+            rows = st.session_state.setdefault(part_key, [])
+            hechas = len(rows)
+            bar, status = st.progress(hechas / B), st.empty()
+            t_ini = time.time()
+            for i in range(hechas, B):
+                sd = int(seeds[i])
                 try:
-                    rows.append(bootstrap_replica(int(sd), ctx))
+                    rows.append(bootstrap_replica(sd, ctx))
                 except Exception as e:
-                    rows.append({'seed': int(sd), 'error': f"{type(e).__name__}: {e}"})
-                el = time.time() - t_ini
-                bar.progress(i / B)
-                status.caption(f"{i}/{B} réplicas — {el / 60:.1f} min, ≈ {el / i * (B - i) / 60:.1f} min restantes")
+                    rows.append({'seed': sd, 'error': f"{type(e).__name__}: {e}"})
+                el, k = time.time() - t_ini, i + 1 - hechas
+                bar.progress((i + 1) / B)
+                status.caption(f"{i + 1}/{B} réplicas — {el / 60:.1f} min en esta ejecución, "
+                               f"≈ {el / k * (B - i - 1) / 60:.1f} min restantes")
             st.session_state[boot_key] = pd.DataFrame(rows)
+            del st.session_state[part_key]
 
         if boot_key not in st.session_state:
             return
@@ -1607,6 +1739,120 @@ def render_bootstrap(res, cfg, run_key):
         st.download_button("📥 Réplicas del bootstrap (CSV)", bdf.to_csv(index=False),
                            file_name=f"bootstrap_lr_{datetime.now():%Y%m%d}.csv", mime="text/csv",
                            key="boot_dl")
+
+
+def render_romano_wolf(res, cfg, run_key, a_sel, k_sel):
+    """Interfaz del bootstrap de robustez con corrección de Romano-Wolf [23]."""
+    lr = res['lr']
+    N = len(res['tickers'])
+    with st.expander("🔁 Bootstrap de robustez con corrección de Romano-Wolf", expanded=False):
+        st.caption(
+            "Evalúa TODAS las especificaciones (α, κ) seleccionadas arriba sobre cada muestra "
+            "simulada bajo H0 (γ=0). Da, para cada especificación, el p-value bootstrap individual y "
+            "el ajustado por Romano-Wolf, que controla la probabilidad de al menos un falso positivo "
+            "respetando la correlación entre especificaciones. Incluye la especificación principal: "
+            "su p-value individual sirve además como confirmación del bootstrap de la sección 5.")
+        specs, dup = distinct_specs(a_sel, k_sel, N)
+        if not specs:
+            st.warning("Seleccioná valores de α y κ en el panel de arriba.")
+            return
+        main_cnt = int(np.ceil(cfg['kappa'] * N - 1e-9))
+        if not any(abs(a - cfg['confidence_gumbel']) < 1e-9 and c == main_cnt for a, _, c in specs):
+            st.warning("La especificación principal no está en la grilla: agregá su α y su κ arriba.")
+        st.markdown(f"**{len(specs)} especificaciones distintas:** " +
+                    " · ".join(f"α={a:.2f}, ≥{c} activos" for a, _, c in specs))
+        if dup:
+            st.caption("Equivalentes descartadas: " + ", ".join(f"α={a}, κ={k}" for a, k in dup))
+
+        c1, c2, c3 = st.columns(3)
+        B = int(c1.selectbox("Réplicas (B)", [199, 499, 999], index=2, key="rw_B",
+                             help="999 da un p-value mínimo de 0,001 y confirma el bootstrap de la "
+                                  "sección 5 con más precisión."))
+        reest = c2.checkbox("Reestimar el GARCH en cada réplica", value=True, key="rw_reest")
+        seed = int(c3.number_input("Semilla", 0, 2**31 - 1, 12345, key="rw_seed",
+                                   help="Usá una semilla distinta de la del bootstrap de la sección 5."))
+        seg = B * len(res['returns']) / 1000 * (0.9 + 0.18 * len(specs))
+        st.caption(f"Tiempo estimado en una computadora ≈ {seg / 3600:.1f}–{1.5 * seg / 3600:.1f} h. "
+                   "Se puede interrumpir: al volver a presionar el botón continúa desde donde quedó.")
+
+        spec_sig = tuple((round(a, 4), c) for a, _, c in specs)
+        rw_key = f"rw::{run_key}::{spec_sig}::{B}::{reest}::{seed}"
+        part_key = rw_key + "::parcial"
+        parcial = st.session_state.get(part_key)
+        if parcial and rw_key not in st.session_state:
+            st.info(f"⏸️ Hay {len(parcial)} de {B} réplicas ya calculadas. Presioná el botón para continuar.")
+
+        if st.button("▶️ Ejecutar bootstrap Romano-Wolf", key="rw_btn"):
+            with st.spinner("Calculando los LR observados de cada especificación..."):
+                obs = multi_spec_lr(res['z_std'], res['stress_series'], res['Q_bar'], cfg, specs,
+                                    res['t_start'])
+            ctx = bootstrap_context(res, cfg, reestimar_garch=reest)
+            seeds = np.random.SeedSequence(seed).generate_state(B)
+            rows = st.session_state.setdefault(part_key, [])
+            hechas = len(rows)
+            bar, status = st.progress(hechas / B), st.empty()
+            t_ini = time.time()
+            for i in range(hechas, B):
+                sd = int(seeds[i])
+                try:
+                    rows.append(romano_wolf_replica(sd, ctx, specs))
+                except Exception as e:
+                    rows.append({'seed': sd, 'error': f"{type(e).__name__}: {e}"})
+                el, k = time.time() - t_ini, i + 1 - hechas
+                bar.progress((i + 1) / B)
+                status.caption(f"{i + 1}/{B} réplicas — {el / 60:.1f} min en esta ejecución, "
+                               f"≈ {el / k * (B - i - 1) / 60:.0f} min restantes")
+            st.session_state[rw_key] = {'obs': obs, 'rows': pd.DataFrame(rows)}
+            del st.session_state[part_key]
+
+        if rw_key not in st.session_state:
+            return
+        data = st.session_state[rw_key]
+        obs, bdf = data['obs'], data['rows']
+        ok = bdf[bdf['error'].isna()] if 'error' in bdf.columns else bdf
+        if len(ok) == 0:
+            st.error(f"Todas las réplicas fallaron. Primer error: {bdf['error'].dropna().iloc[0]}")
+            return
+        if len(ok) < len(bdf):
+            st.warning(f"{len(bdf) - len(ok)} réplica(s) fallaron y se excluyeron. Primer error: "
+                       f"{bdf['error'].dropna().iloc[0]}")
+        LRb = ok[[f'LR_{i}' for i in range(len(specs))]].values.astype(float)
+        lr_obs = np.array([o['LR'] for o in obs])
+        p_ind, p_rw = romano_wolf_pvalues(lr_obs, LRb)
+        p_asym = [0.5 * float(chi2.sf(x, 1)) if x > 1e-10 else 1.0 for x in lr_obs]
+        tab = pd.DataFrame({
+            'α Gumbel': [a for a, _, _ in specs], 'κ': [k for _, k, _ in specs],
+            'Activos en tensión (mín.)': [c for _, _, c in specs],
+            'Principal': ['★' if abs(a - cfg['confidence_gumbel']) < 1e-9 and c == main_cnt else ''
+                          for a, _, c in specs],
+            'Días informativos': [o['n_inf'] for o in obs], 'γ̂': [o['gamma'] for o in obs],
+            'LR': lr_obs, 'p asintótico': p_asym, 'p bootstrap individual': p_ind,
+            'p Romano-Wolf': p_rw})
+        st.dataframe(_fmt_df(tab, {'α Gumbel': '{:.2f}', 'κ': '{:.2f}', 'γ̂': '{:.4f}', 'LR': '{:.3f}',
+                                   'p asintótico': '{:.4f}', 'p bootstrap individual': '{:.4f}',
+                                   'p Romano-Wolf': '{:.4f}'}), use_container_width=True)
+        n_rw = int((p_rw < 0.05).sum())
+        st.caption(f"{len(ok)} réplicas válidas · p-value mínimo posible: {1 / (len(ok) + 1):.4f}")
+        main_idx = [i for i, (a, _, c) in enumerate(specs)
+                    if abs(a - cfg['confidence_gumbel']) < 1e-9 and c == main_cnt]
+        if main_idx:
+            i = main_idx[0]
+            st.session_state[f"boot_p::{run_key}"] = (float(p_ind[i]), len(ok))
+            msg = (f"Especificación principal: p bootstrap individual = {p_ind[i]:.4f} · "
+                   f"p Romano-Wolf = {p_rw[i]:.4f}.")
+            (st.success if p_rw[i] < 0.05 else st.info)(msg)
+        if n_rw:
+            st.success(f"{n_rw} de {len(specs)} especificaciones rechazan H0 al 5% después de corregir "
+                       "por todas las especificaciones evaluadas (Romano-Wolf).")
+        else:
+            st.warning("Ninguna especificación rechaza H0 al 5% después de corregir por todas las "
+                       "especificaciones evaluadas (Romano-Wolf).")
+        st.download_button("📥 Tabla Romano-Wolf (CSV)", tab.to_csv(index=False),
+                           file_name=f"romano_wolf_{datetime.now():%Y%m%d}.csv", mime="text/csv",
+                           key="rw_dl_tab")
+        st.download_button("📥 Réplicas del bootstrap Romano-Wolf (CSV)", bdf.to_csv(index=False),
+                           file_name=f"romano_wolf_replicas_{datetime.now():%Y%m%d}.csv",
+                           mime="text/csv", key="rw_dl_rep")
 
 
 def render_results(res, cfg, regime, run_key):
@@ -1799,8 +2045,11 @@ def render_results(res, cfg, regime, run_key):
     a_opts = sorted({0.90, 0.95, 0.97, 0.99, cfg['confidence_gumbel']})
     k_opts = sorted({0.20, 0.30, 0.45, 0.60, cfg['kappa']})
     a_sel = c1.multiselect("Valores de α (Gumbel)", a_opts,
-                           default=sorted({cfg['confidence_gumbel'], 0.90, 0.99}))
-    k_sel = c2.multiselect("Valores de κ", k_opts, default=sorted({cfg['kappa'], 0.20, 0.45}))
+                           default=sorted({cfg['confidence_gumbel'], 0.90, 0.95, 0.97, 0.99}),
+                           help="Por defecto: la grilla de la Sección 4.4.3 más α=0.90.")
+    k_sel = c2.multiselect("Valores de κ", k_opts, default=sorted({cfg['kappa'], 0.30, 0.45, 0.60}),
+                           help=f"Con {len(tickers)} activos, lo que importa es cuántos activos exige "
+                                f"cada κ (⌈κ·N⌉); los κ equivalentes se evalúan una sola vez.")
     rob_key = f"robustez::{run_key}"
     if st.button("▶️ Ejecutar panel de robustez", key="run_robustness_btn"):
         if not a_sel or not k_sel:
@@ -1819,7 +2068,10 @@ def render_results(res, cfg, regime, run_key):
         rdf = st.session_state[rob_key]
         n_specs = int(rdf['n_especificaciones_evaluadas'].iloc[0])
         n_id = int(rdf['n_especificaciones_identificadas'].iloc[0])
-        st.info(f"Se evaluaron **{n_specs} especificaciones**; γ identificado en **{n_id}**.")
+        st.info(f"Se evaluaron **{n_specs} especificaciones distintas**; γ identificado en **{n_id}**.")
+        if rdf.attrs.get('descartadas'):
+            st.caption("Descartadas por ser equivalentes a otra (mismo número mínimo de activos en "
+                       "tensión): " + ", ".join(f"α={a}, κ={k}" for a, k in rdf.attrs['descartadas']))
         st.dataframe(_fmt_df(rdf, {'pct_Ht_ventana': '{:.2f}', 'LR_stat': '{:.4f}',
                                    'p_value_corregido': '{:.6f}', 'gamma': '{:.4f}',
                                    'p_value_ajustado_BH': '{:.6f}'}, na_rep='no identificado'),
@@ -1831,6 +2083,8 @@ def render_results(res, cfg, regime, run_key):
         if n_raw > n_bh:
             st.warning("La corrección reduce las especificaciones significativas: reportar los "
                        "resultados ajustados.")
+
+    render_romano_wolf(res, cfg, run_key, a_sel, k_sel)
 
     # ---------------------------------------------------------------- 6. Fase
     st.markdown("---")
