@@ -2,7 +2,7 @@
 # 🎓 TESIS DOCTORAL: Modelo DCC-GARCH Homeostático con EVT (Gumbel)
 # ============================================================================
 # Archivo: app_tesis.py
-# Versión: 2.6 — bootstrap de robustez con corrección de Romano-Wolf (septiembre 2026)
+# Versión: 2.12 — bootstraps que se reanudan solos y guardan en disco (octubre 2026)
 # Ejecutar: streamlit run app_tesis.py
 #
 # CAMBIOS RESPECTO DE LA VERSIÓN ANTERIOR (el detalle está en cada función):
@@ -55,8 +55,68 @@
 #      exactamente el mismo H_t y no deben contarse dos veces en la corrección).
 # [23] v2.6: bootstrap de robustez con corrección de Romano-Wolf (stepdown
 #      sobre el máximo LR), que respeta la correlación entre especificaciones.
+# [24] v2.7: parametrización alternativa del término homeostático,
+#        Q_t = (1−a−b)·[(1−λH_{t−1})·Q̄ + λH_{t−1}·Q^(S)_t] + a·z z' + b·Q_{t−1},
+#      con λ ∈ [0,1] = fracción del objetivo de largo plazo que se desplaza
+#      hacia Q^(S) en tensión. Equivale a γ = λ(1−a−b). Con la parametrización
+#      γ, la restricción a+b+γ ≤ 0.998 fijaba un techo arbitrario y en la
+#      muestra 2008–2026 γ̂ quedó exactamente en ese techo. Nota conceptual:
+#      a+b+γ<1 no es una condición de estacionariedad (la persistencia de Q_t
+#      la da a+b; γ solo mueve el intercepto), sino de positividad del peso
+#      de Q̄: es exactamente λ ≤ 1.
+# [25] v2.7: el bootstrap y Romano-Wolf registran los días informativos de
+#      cada réplica y los comparan con los observados (calibración del DGP).
+# [26] v2.8: opción de bootstrap CONDICIONAL A LA VOLATILIDAD OBSERVADA: en
+#      vez de simular un GARCH independiente por activo, cada réplica usa la
+#      trayectoria de volatilidad σ_t estimada en los datos reales (con sus
+#      crisis y su factor común) y simula solo las correlaciones bajo H0:
+#      r*_t = σ_t · z*_t. H2 es una hipótesis sobre correlaciones, así que
+#      condicionar a la volatilidad es legítimo, y reproduce mejor la tensión
+#      conjunta (el DGP con GARCH simulado generaba menos días de tensión).
+#      ⚠️ v2.9: DESACONSEJADO. En la práctica, fijar la volatilidad hace colapsar
+#      la distribución nula del LR (LR* > 0 en ~7–10% de las réplicas, contra
+#      ~40% con GARCH simulado y 50% asintótico), también en datos sintéticos
+#      donde el DGP con GARCH estaba bien calibrado. Con σ fija, los días de
+#      tensión quedan determinados casi solo por la volatilidad y dejan de
+#      depender de z*, así que Q^(S)* ≈ Q̄ y λ no tiene efecto bajo H0: los
+#      p-values resultan artificialmente chicos. Se conserva solo para
+#      documentar el diagnóstico; la opción por defecto es el GARCH simulado.
+# [27] v2.8: el clasificador de fases responde "NO APLICA" en ventanas de
+#      más de 3 años, y sus etiquetas usan λ cuando se usa esa parametrización.
+# [28] v2.10: tercer canal del efecto de la tensión, el SALTO DIRECTO (ω):
+#        Q̃_t = (1−a−b)·Q̄ + a·z_{t−1}z'_{t−1} + b·Q_{t−1}
+#        Q_t  = (1−ω·H_{t−1})·Q̃_t + ω·H_{t−1}·Q^(S)_t,     ω ∈ [0,1]
+#      En un día posterior a una tensión, la correlación cierra una fracción
+#      ω de la distancia a la estructura de estrés. A diferencia de λ, el
+#      efecto no está limitado por el peso 1−a−b del objetivo de largo plazo,
+#      y se acumula y desvanece con la persistencia b (el salto queda en Q_t).
+#      Q_t es combinación convexa de matrices DP, así que siempre es DP; en
+#      tensión la persistencia efectiva baja a (1−ω)·b.
+# [29] v2.11: contraste contra el DCC asimétrico (ADCC; Cappiello, Engle y
+#      Sheppard, 2006). Explicación alternativa: las correlaciones suben más
+#      tras caídas fuertes, y los días de tensión suelen ser días de caídas.
+#      Se estiman DCC, ADCC, DCC-H con ω y ADCC-H (asimetría + ω), y la prueba
+#      decisiva es ADCC-H contra ADCC: si ω sigue siendo significativo con la
+#      asimetría incluida, el salto no es solo esa asimetría. Incluye un
+#      bootstrap paramétrico bajo el ADCC (ω = 0) para esa prueba.
+# [30] v2.11: los mensajes del test y del bootstrap usan el símbolo de la
+#      parametrización elegida (γ, λ u ω).
+# [31] v2.12: los bootstraps largos (sección 5, Romano-Wolf y ADCC) siguen
+#      solos después de una interrupción. Streamlit corta el script cada vez
+#      que la página se vuelve a ejecutar (un clic, la pestaña en segundo
+#      plano que se desconecta y reconecta, la computadora que se suspende);
+#      antes había que volver a presionar el botón. Ahora: (a) presionado una
+#      vez, el cálculo se reanuda automáticamente en cada nueva ejecución hasta
+#      terminar o hasta presionar "Pausar"; (b) cada réplica se guarda también
+#      en disco (carpeta checkpoints_bootstrap junto a la app), así que el
+#      avance sobrevive aunque se cierre la pestaña o se reinicie Streamlit;
+#      (c) el contexto del bootstrap y los LR observados se calculan una sola
+#      vez por sesión, no en cada reanudación.
 # ============================================================================
 
+import os
+import hashlib
+import pickle
 import time
 import streamlit as st
 import yfinance as yf
@@ -94,7 +154,16 @@ UMBRAL_H_ALTO = 10.0
 # aceptable (p. ej. ≥ 80%).
 MIN_INFORMATIVOS_POTENCIA = 60
 DCC_H_BOUNDS = [(1e-6, 0.3), (0.5, 0.998), (0.0, 0.3)]   # a, b, γ
-DCC_STATIONARITY = 0.998      # a + b + γ <= 0.998
+DCC_STATIONARITY = 0.998      # a + b + γ <= 0.998 (parametrización γ); a + b <= 0.998 (λ)
+LAMBDA_BOUNDS = [(1e-6, 0.3), (0.5, 0.998), (0.0, 1.0)]   # a, b, λ  [24]
+OMEGA_BOUNDS = [(1e-6, 0.3), (0.5, 0.998), (0.0, 1.0)]    # a, b, ω  [28]
+PARAM_LABELS = {'gamma': 'γ', 'lambda': 'λ', 'omega': 'ω'}
+FRACTION_PARAMS = ('lambda', 'omega')     # tercer parámetro en [0,1]; persistencia = a + b
+
+
+def _bounds(param, k):
+    return (DCC_H_BOUNDS if param == 'gamma' else
+            OMEGA_BOUNDS if param == 'omega' else LAMBDA_BOUNDS)[:k]
 
 # ============================================================================
 # 🎨 ESTILOS CSS
@@ -625,7 +694,7 @@ def count_informative_days(H, active, t_start):
     return int(np.sum((H[idx - 1] == 1) & active[idx]))
 
 
-def _dcc_recursion_loop(Z, H, Q_bar, Qs, a, b, gamma, store=False):
+def _dcc_recursion_loop(Z, H, Q_bar, Qs, a, b, gamma, store=False, omega=0.0):
     """
     Recursión ÚNICA del DCC-H, usada en estimación y en filtrado.  [1]
 
@@ -661,6 +730,8 @@ def _dcc_recursion_loop(Z, H, Q_bar, Qs, a, b, gamma, store=False):
                 Q_t = (w_q - gamma) * Q_bar + a * np.outer(z1, z1) + b * Q_prev + gamma * Qs[t]
             else:
                 Q_t = w_q * Q_bar + a * np.outer(z1, z1) + b * Q_prev
+            if omega > 0 and H[t - 1] == 1:          # [28] salto directo hacia Q^(S)
+                Q_t = (1 - omega) * Q_t + omega * Qs[t]
         d = np.sqrt(np.clip(np.diag(Q_t), 1e-12, None))
         R_t = Q_t / np.outer(d, d)
         try:
@@ -709,24 +780,82 @@ def _dcc_recursion_vec(Z, H, Q_bar, Qs, a, b, gamma):
     return -0.5 * (logdet + quad), Q, R
 
 
-def dcc_recursion(Z, H, Q_bar, Qs, a, b, gamma, store=False):
+def _lik_from_Q(Z, Q):
+    """Normaliza Q_t a R_t y calcula ℓ_t = −½[ln|R_t| + z_t'R_t⁻¹z_t] en lote."""
+    d = np.sqrt(np.clip(np.einsum('tii->ti', Q), 1e-12, None))
+    R = Q / (d[:, :, None] * d[:, None, :])
+    L = np.linalg.cholesky(R)                       # LinAlgError si alguna falla
+    logdet = 2.0 * np.sum(np.log(np.einsum('tii->ti', L)), axis=1)
+    quad = np.einsum('ti,ti->t', Z, np.linalg.solve(R, Z[:, :, None])[:, :, 0])
+    return -0.5 * (logdet + quad), R
+
+
+def _dcc_recursion_omega_vec(Z, H, Q_bar, Qs, a, b, omega):
+    """
+    [28] Recursión con salto directo, vectorizada. Para t >= 1:
+        Q_t = β_t·Q_{t−1} + c_t,  β_t = b(1−ωh),  c_t = (1−ωh)·[(1−a−b)Q̄ + a z z'] + ωh·Q^(S)_t
+    con h = H_{t−1}. Como β_t solo toma dos valores, se aplica un filtro IIR
+    (lfilter) por tramos de H constante, encadenando el estado entre tramos.
+    """
+    T, N = Z.shape
+    Q = np.empty((T, N, N))
+    Q[0] = Q_bar
+    if T > 1:
+        Z1 = Z[:-1]
+        h = (np.asarray(H[:-1]) == 1)
+        w = omega * h
+        C = (1 - w)[:, None, None] * ((1 - a - b) * Q_bar + a * (Z1[:, :, None] * Z1[:, None, :])) \
+            + w[:, None, None] * Qs[1:]
+        beta = b * (1 - w)
+        cuts = np.r_[0, np.flatnonzero(np.diff(h.astype(np.int8))) + 1, T - 1]
+        prev = Q_bar
+        for s_, e_ in zip(cuts[:-1], cuts[1:]):
+            bt = beta[s_]
+            seg, _ = lfilter([1.0], [1.0, -bt], C[s_:e_], axis=0, zi=(bt * prev)[None])
+            Q[1 + s_:1 + e_] = seg
+            prev = seg[-1]
+    contrib, R = _lik_from_Q(Z, Q)
+    return contrib, Q, R
+
+
+def dcc_recursion(Z, H, Q_bar, Qs, a, b, gamma, store=False, omega=0.0):
     """Recursión DCC-H (ver _dcc_recursion_loop): vía rápida vectorizada con respaldo en bucle."""
     try:
-        contrib, Q, R = _dcc_recursion_vec(Z, H, Q_bar, Qs, a, b, gamma)
+        if omega > 0:
+            contrib, Q, R = _dcc_recursion_omega_vec(Z, H, Q_bar, Qs, a, b, omega)
+        else:
+            contrib, Q, R = _dcc_recursion_vec(Z, H, Q_bar, Qs, a, b, gamma)
         if np.all(np.isfinite(contrib)):
             return contrib, True, (Q if store else None), (R if store else None)
     except np.linalg.LinAlgError:
         pass
-    return _dcc_recursion_loop(Z, H, Q_bar, Qs, a, b, gamma, store)
+    return _dcc_recursion_loop(Z, H, Q_bar, Qs, a, b, gamma, store, omega=omega)
 
 
-def _unpack(params):
+def _unpack(params, param='gamma'):
+    """(a, b, γ efectivo). Con param='lambda', γ = λ(1−a−b) [24]; con 'omega', γ = 0 (ver _omega_of)."""
     a, b = float(params[0]), float(params[1])
-    gamma = float(params[2]) if len(params) > 2 else 0.0
+    third = float(params[2]) if len(params) > 2 else 0.0
+    gamma = third * (1 - a - b) if param == 'lambda' else (0.0 if param == 'omega' else third)
     return a, b, gamma
 
 
-def dcc_loglik(params, Z, H, Q_bar, Qs, t_start=1, return_contributions=False):
+def _omega_of(params, param):
+    """ω del salto directo [28] (0 en las otras parametrizaciones)."""
+    return float(params[2]) if (param == 'omega' and len(params) > 2) else 0.0
+
+
+def _valid(params, param='gamma'):
+    a, b = float(params[0]), float(params[1])
+    third = float(params[2]) if len(params) > 2 else 0.0
+    if a < 0 or b < 0 or third < 0:
+        return False
+    if param in FRACTION_PARAMS:
+        return third <= 1.0 and a + b < 0.999
+    return a + b + third < 0.999
+
+
+def dcc_loglik(params, Z, H, Q_bar, Qs, t_start=1, return_contributions=False, param='gamma'):
     """
     Log-verosimilitud (parte de correlación) sumada desde t_start.
     CORRECCIÓN [2]: cualquier región inválida devuelve −1e10 (antes −1000,
@@ -735,10 +864,10 @@ def dcc_loglik(params, Z, H, Q_bar, Qs, t_start=1, return_contributions=False):
     También se eliminó el descarte selectivo de observaciones: todos los
     parámetros se evalúan sobre exactamente la misma muestra.
     """
-    a, b, gamma = _unpack(params)
-    if a < 0 or b < 0 or gamma < 0 or a + b + gamma >= 0.999:
+    if not _valid(params, param):
         return (PENALTY, None) if return_contributions else PENALTY
-    contrib, ok, _, _ = dcc_recursion(Z, H, Q_bar, Qs, a, b, gamma)
+    a, b, gamma = _unpack(params, param)
+    contrib, ok, _, _ = dcc_recursion(Z, H, Q_bar, Qs, a, b, gamma, omega=_omega_of(params, param))
     c = contrib[t_start:]
     if not ok or not np.all(np.isfinite(c)):
         return (PENALTY, None) if return_contributions else PENALTY
@@ -750,7 +879,7 @@ def dcc_loglik(params, Z, H, Q_bar, Qs, t_start=1, return_contributions=False):
 
 
 def estimate_dcc_parameters(Z, H, Q_bar, Qs, model_type='DCC-H', t_start=1,
-                            restricted_params=None):
+                            restricted_params=None, param='gamma'):
     """
     MLE de (a, b[, γ]) con SLSQP, restricción explícita de estacionariedad
     y multi-start. Para el DCC-H se incluye como punto de partida el óptimo
@@ -758,10 +887,24 @@ def estimate_dcc_parameters(Z, H, Q_bar, Qs, model_type='DCC-H', t_start=1,
     garantiza log L(DCC-H) >= log L(DCC) y, por lo tanto, LR >= 0.
     """
     def neg(p):
-        ll = dcc_loglik(p, Z, H, Q_bar, Qs, t_start)
+        ll = dcc_loglik(p, Z, H, Q_bar, Qs, t_start, param=param)
         return 1e10 if (not np.isfinite(ll) or ll <= PENALTY) else -ll
 
-    if model_type == 'DCC-H':
+    if model_type == 'DCC-H' and param == 'omega':
+        bounds = OMEGA_BOUNDS
+        cons = ({'type': 'ineq', 'fun': lambda p: DCC_STATIONARITY - (p[0] + p[1])},)
+        starts = [[0.02, 0.93, 0.05], [0.05, 0.85, 0.2]]
+        if restricted_params is not None:
+            ar, br = float(restricted_params[0]), float(restricted_params[1])
+            starts = [[ar, br, 0.0], [ar, br, 0.02], [ar, br, 0.1], [ar, br, 0.3]] + starts
+    elif model_type == 'DCC-H' and param == 'lambda':
+        bounds = LAMBDA_BOUNDS
+        cons = ({'type': 'ineq', 'fun': lambda p: DCC_STATIONARITY - (p[0] + p[1])},)
+        starts = [[0.02, 0.93, 0.5], [0.05, 0.85, 0.9]]
+        if restricted_params is not None:
+            ar, br = float(restricted_params[0]), float(restricted_params[1])
+            starts = [[ar, br, 0.0], [ar, br, 0.5], [ar, br, 1.0]] + starts
+    elif model_type == 'DCC-H':
         bounds = DCC_H_BOUNDS
         cons = ({'type': 'ineq', 'fun': lambda p: DCC_STATIONARITY - (p[0] + p[1] + p[2])},)
         starts = [[0.02, 0.93, 0.02], [0.05, 0.85, 0.05]]
@@ -790,7 +933,7 @@ def estimate_dcc_parameters(Z, H, Q_bar, Qs, model_type='DCC-H', t_start=1,
     return best
 
 
-def compute_robust_se(Z, H, Q_bar, Qs, params, t_start=1, h=1e-4):
+def compute_robust_se(Z, H, Q_bar, Qs, params, t_start=1, h=1e-4, param='gamma'):
     """
     Errores estándar de la Etapa 2 por diferencias finitas.  [10]
 
@@ -807,11 +950,12 @@ def compute_robust_se(Z, H, Q_bar, Qs, params, t_start=1, h=1e-4):
     """
     params = np.asarray(params, dtype=float)
     k = len(params)
-    lower = [bd[0] for bd in DCC_H_BOUNDS[:k]]
-    upper = [bd[1] for bd in DCC_H_BOUNDS[:k]]
+    lower = [bd[0] for bd in _bounds(param, k)]
+    upper = [bd[1] for bd in _bounds(param, k)]
     frontera = np.array([(params[j] - 2 * h < lower[j]) or (params[j] + 2 * h > upper[j])
                          for j in range(k)])
-    if params.sum() + 2 * h >= 0.999:
+    persist = params[0] + params[1] if param in FRACTION_PARAMS else params.sum()
+    if persist + 2 * h >= 0.999:
         frontera[:] = True
     out = {'se_sandwich': np.full(k, np.nan), 'se_opg': np.full(k, np.nan), 'frontera': frontera}
     J = [j for j in range(k) if not frontera[j]]
@@ -819,7 +963,7 @@ def compute_robust_se(Z, H, Q_bar, Qs, params, t_start=1, h=1e-4):
         return out
 
     def f(p):
-        return dcc_loglik(p, Z, H, Q_bar, Qs, t_start, return_contributions=True)
+        return dcc_loglik(p, Z, H, Q_bar, Qs, t_start, return_contributions=True, param=param)
 
     f0, _ = f(params)
     n = len(J)
@@ -867,10 +1011,11 @@ def compute_robust_se(Z, H, Q_bar, Qs, params, t_start=1, h=1e-4):
     return out
 
 
-def dcc_filter(Z, H, Q_bar, Qs, params):
+def dcc_filter(Z, H, Q_bar, Qs, params, param='gamma'):
     """Filtra R_t y Q_t con parámetros dados (misma recursión que la estimación)."""
-    a, b, gamma = _unpack(params)
-    _, _, Q_t, R_t = dcc_recursion(Z, H, Q_bar, Qs, a, b, gamma, store=True)
+    a, b, gamma = _unpack(params, param)
+    _, _, Q_t, R_t = dcc_recursion(Z, H, Q_bar, Qs, a, b, gamma, store=True,
+                                   omega=_omega_of(params, param))
     return R_t, Q_t
 
 
@@ -878,7 +1023,7 @@ def dcc_filter(Z, H, Q_bar, Qs, params):
 # 🧪 TEST DE RAZÓN DE VEROSIMILITUD Y COMPARACIONES MÚLTIPLES
 # ============================================================================
 
-def likelihood_ratio_test(Z, H, Q_bar, Qs, active, t_start=1, compute_se=True):
+def likelihood_ratio_test(Z, H, Q_bar, Qs, active, t_start=1, compute_se=True, param='gamma'):
     """
     LR: DCC-H vs DCC estándar, con corrección de frontera (γ >= 0):
     bajo H0 el LR se distribuye como ½χ²(0) + ½χ²(1) (Self & Liang, 1987),
@@ -896,7 +1041,7 @@ def likelihood_ratio_test(Z, H, Q_bar, Qs, active, t_start=1, compute_se=True):
 
     res_r = estimate_dcc_parameters(Z, H, Q_bar, Qs, 'DCC', t_start)
     ll_r = -res_r.fun
-    out = {'n_informativos': n_inf, 'n_obs_lik': n_obs, 'params_restricted': res_r.x,
+    out = {'param': param, 'n_informativos': n_inf, 'n_obs_lik': n_obs, 'params_restricted': res_r.x,
            'log_lik_restricted': ll_r, 'df': 1,
            'critical_value': chi2.ppf(0.90, 1), 'critical_value_naive': chi2.ppf(0.95, 1)}
 
@@ -904,11 +1049,18 @@ def likelihood_ratio_test(Z, H, Q_bar, Qs, active, t_start=1, compute_se=True):
         out.update({'identificado': False, 'lr_statistic': np.nan, 'p_value': np.nan,
                     'p_value_naive': np.nan, 'decision': 'NO_IDENTIFICADO',
                     'params_unrestricted': np.r_[res_r.x, 0.0], 'log_lik_unrestricted': ll_r,
-                    'se': None})
+                    'gamma_efectivo': 0.0, 'en_techo': False, 'se': None})
         return out
 
-    res_u = estimate_dcc_parameters(Z, H, Q_bar, Qs, 'DCC-H', t_start, restricted_params=res_r.x)
+    res_u = estimate_dcc_parameters(Z, H, Q_bar, Qs, 'DCC-H', t_start, restricted_params=res_r.x,
+                                    param=param)
     ll_u = -res_u.fun
+    a_u, b_u, g_eff = _unpack(res_u.x, param)
+    if param == 'omega':
+        g_eff = np.nan                     # [28] ω no tiene un γ equivalente
+    # [24] ¿El tercer parámetro quedó en su techo? (γ: a+b+γ = 0.998; λ y ω: = 1)
+    en_techo = (res_u.x[2] >= 1 - 1e-4) if param in FRACTION_PARAMS else \
+               (a_u + b_u + g_eff >= DCC_STATIONARITY - 1e-5 and g_eff > 1e-6)
     lr = max(0.0, 2 * (ll_u - ll_r))
     p_naive = float(chi2.sf(lr, 1)) if lr > 1e-10 else 1.0
     p_corr = 0.5 * p_naive if lr > 1e-10 else 1.0
@@ -917,7 +1069,9 @@ def likelihood_ratio_test(Z, H, Q_bar, Qs, active, t_start=1, compute_se=True):
                 'p_value_naive': p_naive,
                 'decision': 'RECHAZAR_H0' if p_corr < ALPHA_TEST else 'NO_RECHAZAR_H0',
                 'params_unrestricted': res_u.x, 'log_lik_unrestricted': ll_u,
-                'se': compute_robust_se(Z, H, Q_bar, Qs, res_u.x, t_start) if compute_se else None})
+                'gamma_efectivo': g_eff, 'en_techo': bool(en_techo),
+                'se': (compute_robust_se(Z, H, Q_bar, Qs, res_u.x, t_start, param=param)
+                       if compute_se else None)})
     return out
 
 
@@ -959,7 +1113,7 @@ def distinct_specs(alpha_grid, kappa_grid, N):
 
 
 def run_robustness_panel(z_std, stress_series, loc_df, scale_df, Q_bar, t0, t_start, alpha_grid,
-                         kappa_grid, min_obs=30):
+                         kappa_grid, min_obs=30, param='gamma'):
     """
     Panel de robustez (Sección 4.6): re-ejecuta Gumbel → H_t → Q^(S) → LR para
     cada (α, κ) y aplica Benjamini-Hochberg SOLO sobre las especificaciones
@@ -976,7 +1130,7 @@ def run_robustness_panel(z_std, stress_series, loc_df, scale_df, Q_bar, t0, t_st
         H_g, _ = calculate_systemic_indicator(ind, k_g)
         Hv = H_g.values
         Qs_g, act_g = compute_recursive_Qstress(Z, Hv, Q_bar, min_obs)
-        lr = likelihood_ratio_test(Z, Hv, Q_bar, Qs_g, act_g, t_start, compute_se=False)
+        lr = likelihood_ratio_test(Z, Hv, Q_bar, Qs_g, act_g, t_start, compute_se=False, param=param)
         rows.append({
             'alpha_gumbel': a_g, 'kappa': k_g, 'activos_en_tension_min': cnt,
             'dias_Ht_ventana': int(Hv[t0:].sum()),
@@ -985,6 +1139,8 @@ def run_robustness_panel(z_std, stress_series, loc_df, scale_df, Q_bar, t0, t_st
             'LR_stat': lr['lr_statistic'],
             'p_value_corregido': lr['p_value'],
             'gamma': float(lr['params_unrestricted'][2]),
+            'gamma_efectivo': float(lr['gamma_efectivo']),
+            'en_techo': bool(lr['en_techo']),
         })
     df = pd.DataFrame(rows)
     df['p_value_ajustado_BH'] = np.nan
@@ -1035,8 +1191,13 @@ def whitened_innovations(z, R_t):
     return E @ np.linalg.inv(Lc).T
 
 
-def simulate_restricted(rng, E, n_total, a, b, Q_bar, omega, alpha, beta, sigma2_0):
-    """Simula (z, r) de longitud n_total desde el DCC restringido (γ=0) + GARCH por activo."""
+def simulate_restricted(rng, E, n_total, a, b, Q_bar, omega, alpha, beta, sigma2_0,
+                        sigma_path=None):
+    """
+    Simula (z, r) de longitud n_total desde el DCC restringido (γ=0).
+    Volatilidad: GARCH por activo (sigma_path=None) o, [26], la trayectoria
+    observada σ_t (array n_total x N): r*_t = σ_t · z*_t.
+    """
     N = Q_bar.shape[0]
     idx = rng.integers(0, len(E), n_total)
     Z = np.empty((n_total, N))
@@ -1047,15 +1208,16 @@ def simulate_restricted(rng, E, n_total, a, b, Q_bar, omega, alpha, beta, sigma2
             Q = Q_bar
         else:
             Q = w * Q_bar + a * np.outer(Z[t - 1], Z[t - 1]) + b * Q_prev
-            s2 = omega + alpha * r[t - 1] ** 2 + beta * s2
+            if sigma_path is None:
+                s2 = omega + alpha * r[t - 1] ** 2 + beta * s2
         d = np.sqrt(np.diag(Q))
         Z[t] = np.linalg.cholesky(Q / np.outer(d, d)) @ E[idx[t]]
-        r[t] = np.sqrt(s2) * Z[t]
+        r[t] = (sigma_path[t] if sigma_path is not None else np.sqrt(s2)) * Z[t]
         Q_prev = Q
     return Z, r
 
 
-def bootstrap_context(res, cfg, reestimar_garch=True):
+def bootstrap_context(res, cfg, reestimar_garch=True, volatilidad='garch'):
     """Todo lo necesario para simular bajo H0, extraído de una corrida de la app."""
     gdf = res['garch_df'].set_index('Ticker').loc[res['tickers']]
     a_r, b_r = [float(x) for x in res['lr']['params_restricted'][:2]]
@@ -1067,6 +1229,8 @@ def bootstrap_context(res, cfg, reestimar_garch=True):
         'sigma2_0': res['sigma'][0] ** 2,
         'index': res['returns'].index, 'columns': list(res['returns'].columns),
         't_start': res['t_start'], 'cfg': dict(cfg), 'reestimar_garch': reestimar_garch,
+        'volatilidad': volatilidad,
+        'sigma_path': np.asarray(res['sigma'], dtype=float) if volatilidad == 'observada' else None,
     }
 
 
@@ -1075,7 +1239,8 @@ def bootstrap_replica(seed, ctx):
     rng = np.random.default_rng(seed)
     n = len(ctx['index'])
     Zs, rs = simulate_restricted(rng, ctx['E'], n, ctx['a'], ctx['b'], ctx['Q_bar'],
-                                 ctx['omega'], ctx['alpha'], ctx['beta'], ctx['sigma2_0'])
+                                 ctx['omega'], ctx['alpha'], ctx['beta'], ctx['sigma2_0'],
+                                 sigma_path=ctx.get('sigma_path'))
     ret = pd.DataFrame(rs, index=ctx['index'], columns=ctx['columns'])
     if ctx['reestimar_garch']:
         z_df, _, _, _ = garch_filter(ret)
@@ -1084,7 +1249,7 @@ def bootstrap_replica(seed, ctx):
     Q_bar_h = ensure_positive_definite(np.corrcoef(z_df.values.T), min_eig=1e-6)
     _, _, _, _, H, _, Qs, active, _ = _stress_block(z_df, ret, ctx['cfg'], Q_bar_h)
     lr = likelihood_ratio_test(z_df.values, H.values, Q_bar_h, Qs, active, ctx['t_start'],
-                               compute_se=False)
+                               compute_se=False, param=ctx['cfg'].get('param_homeo', 'gamma'))
     return {'seed': seed, 'identificado': bool(lr['identificado']),
             'dias_informativos': int(lr['n_informativos']),
             'LR': float(lr['lr_statistic']) if lr['identificado'] else 0.0,
@@ -1094,6 +1259,335 @@ def bootstrap_replica(seed, ctx):
 def bootstrap_pvalue(lr_obs, lr_boot):
     lr_boot = np.asarray(lr_boot, dtype=float)
     return (1 + np.sum(lr_boot >= lr_obs - 1e-12)) / (len(lr_boot) + 1)
+
+
+# ----------------------------------------------------------------------------
+# Ejecución reanudable de bootstraps largos  [31]
+# ----------------------------------------------------------------------------
+CHECKPOINT_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "checkpoints_bootstrap")
+
+
+def _data_fp(res):
+    """Huella de los datos: el avance guardado en disco solo se reusa con los mismos retornos."""
+    return int(pd.util.hash_pandas_object(res['returns'], index=True).sum()) % (2 ** 61)
+
+
+def _ckpt_path(key):
+    return os.path.join(CHECKPOINT_DIR, hashlib.md5(key.encode('utf-8')).hexdigest()[:20] + ".pkl")
+
+
+def _ckpt_load(key, fp):
+    try:
+        with open(_ckpt_path(key), 'rb') as f:
+            d = pickle.load(f)
+        return d if d.get('key') == key and d.get('fp') == fp else None
+    except Exception:
+        return None
+
+
+def _ckpt_save(key, fp, rows, completo=False):
+    try:
+        os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+        path = _ckpt_path(key)
+        with open(path + '.tmp', 'wb') as f:
+            pickle.dump({'key': key, 'fp': fp, 'rows': list(rows), 'completo': completo,
+                         'guardado': datetime.now().isoformat(timespec='seconds')}, f)
+        os.replace(path + '.tmp', path)
+    except Exception:
+        pass  # el disco es un respaldo: si falla, sigue valiendo lo guardado en la sesión
+
+
+def run_resumable(key, res, B, seed, build_ctx, replica, btn_label, btn_key):
+    """Corre B réplicas de un bootstrap y devuelve el DataFrame cuando termina (si no, None).
+
+    Una vez presionado el botón, el cálculo continúa solo en cada nueva ejecución de la
+    página hasta terminar o hasta presionar "Pausar". Cada réplica queda en la sesión y en
+    disco, así que una interrupción nunca pierde más que la réplica en curso.
+    """
+    fp = _data_fp(res)
+    if key in st.session_state:
+        return st.session_state[key]
+    disk = _ckpt_load(key, fp)
+    if disk and disk.get('completo'):
+        st.session_state[key] = pd.DataFrame(disk['rows'])
+        return st.session_state[key]
+
+    part_key, act_key, ctx_key = key + "::parcial", key + "::activo", key + "::ctx"
+    rows = st.session_state.get(part_key)
+    if rows is None and disk:
+        rows = list(disk['rows'])
+        st.session_state[part_key] = rows
+    hechas = len(rows) if rows else 0
+
+    activo = st.session_state.get(act_key, False)
+    c1, c2 = st.columns([3, 1])
+    if c1.button(btn_label, key=btn_key):
+        st.session_state[act_key] = activo = True
+    if c2.button("⏸️ Pausar", key=btn_key + "_pausa", disabled=not activo):
+        st.session_state[act_key] = activo = False
+    if not activo:
+        if hechas:
+            st.info(f"⏸️ {hechas} de {B} réplicas guardadas. Presioná el botón para continuar desde ahí.")
+        return None
+
+    if hechas:
+        st.caption(f"Reanudando desde la réplica {hechas + 1} (las anteriores están guardadas en la "
+                   "sesión y en disco).")
+    if ctx_key not in st.session_state:
+        with st.spinner("Preparando el bootstrap (se hace una sola vez por sesión)..."):
+            st.session_state[ctx_key] = build_ctx()
+    ctx = st.session_state[ctx_key]
+    seeds = np.random.SeedSequence(seed).generate_state(B)
+    rows = st.session_state.setdefault(part_key, [])
+    hechas = len(rows)
+    bar, status = st.progress(hechas / B), st.empty()
+    t_ini = time.time()
+    for i in range(hechas, B):
+        sd = int(seeds[i])
+        try:
+            rows.append(replica(sd, ctx))
+        except Exception as e:
+            rows.append({'seed': sd, 'error': f"{type(e).__name__}: {e}"})
+        _ckpt_save(key, fp, rows)
+        el, k = time.time() - t_ini, i + 1 - hechas
+        bar.progress((i + 1) / B)
+        status.caption(f"{i + 1}/{B} réplicas — {el / 60:.1f} min en esta ejecución, "
+                       f"≈ {el / k * (B - i - 1) / 60:.0f} min restantes. Si la página se interrumpe, "
+                       "sigue sola desde la última réplica guardada.")
+    df = pd.DataFrame(rows)
+    _ckpt_save(key, fp, rows, completo=True)
+    st.session_state[key] = df
+    for kk in (part_key, act_key, ctx_key):
+        st.session_state.pop(kk, None)
+    return df
+
+
+# ============================================================================
+# ⚖️ CONTRASTE CONTRA EL DCC ASIMÉTRICO (ADCC)  [29]
+# ============================================================================
+#
+# ADCC escalar (Cappiello, Engle y Sheppard, 2006), con n_t = z_t ∘ 1(z_t < 0):
+#   Q̃_t = (1−a−b)·Q̄ − g·N̄ + a·z_{t−1}z'_{t−1} + g·n_{t−1}n'_{t−1} + b·Q_{t−1},  N̄ = E[n n']
+# ADCC-H agrega el salto directo [28]:  Q_t = (1−ω·H_{t−1})·Q̃_t + ω·H_{t−1}·Q^(S)_t
+# Restricciones: a, b, g ≥ 0; ω ∈ [0, 1]; a + b + δ·g < 1, con δ el mayor autovalor
+# de Q̄^{−1/2} N̄ Q̄^{−1/2}; y el intercepto (1−a−b)Q̄ − gN̄ definido positivo, lo que
+# garantiza que Q_t lo sea.
+# ============================================================================
+
+def asym_matrix(Z):
+    """N̄ = promedio de n_t n'_t, con n_t = z_t en los activos con z < 0 y 0 en el resto."""
+    Z = np.asarray(Z, dtype=float)
+    n = Z * (Z < 0)
+    return (n.T @ n) / len(n)
+
+
+def asym_delta(Q_bar, N_bar):
+    w, V = np.linalg.eigh(Q_bar)
+    Qm = V @ np.diag(1 / np.sqrt(np.clip(w, 1e-12, None))) @ V.T
+    return float(np.max(np.linalg.eigvalsh(Qm @ N_bar @ Qm)))
+
+
+def _adcc_unpack(p):
+    return float(p[0]), float(p[1]), float(p[2]), (float(p[3]) if len(p) > 3 else 0.0)
+
+
+def _adcc_intercept(Q_bar, N_bar, a, b, g):
+    return (1 - a - b) * Q_bar - g * N_bar
+
+
+def _adcc_Q(Z, H, Q_bar, N_bar, Qs, a, b, g, w):
+    """Q_t del ADCC (w = 0) o del ADCC-H (w > 0), con filtro IIR por tramos de H constante."""
+    T, N = Z.shape
+    Q = np.empty((T, N, N))
+    Q[0] = Q_bar
+    if T > 1:
+        Z1 = Z[:-1]
+        n1 = Z1 * (Z1 < 0)
+        base = _adcc_intercept(Q_bar, N_bar, a, b, g) + a * (Z1[:, :, None] * Z1[:, None, :]) \
+            + g * (n1[:, :, None] * n1[:, None, :])
+        if w > 0:
+            h = (np.asarray(H[:-1]) == 1)
+            wt = w * h
+            C = (1 - wt)[:, None, None] * base + wt[:, None, None] * Qs[1:]
+            beta = b * (1 - wt)
+            cuts = np.r_[0, np.flatnonzero(np.diff(h.astype(np.int8))) + 1, T - 1]
+        else:
+            C, beta, cuts = base, np.full(T - 1, b), np.array([0, T - 1])
+        prev = Q_bar
+        for s_, e_ in zip(cuts[:-1], cuts[1:]):
+            bt = beta[s_]
+            seg, _ = lfilter([1.0], [1.0, -bt], C[s_:e_], axis=0, zi=(bt * prev)[None])
+            Q[1 + s_:1 + e_] = seg
+            prev = seg[-1]
+    return Q
+
+
+def adcc_valid(p, Q_bar, N_bar, delta):
+    a, b, g, w = _adcc_unpack(p)
+    if min(a, b, g, w) < 0 or w > 1 or a + b + delta * g >= 0.999:
+        return False
+    return float(np.min(np.linalg.eigvalsh(_adcc_intercept(Q_bar, N_bar, a, b, g)))) > 1e-8
+
+
+def adcc_loglik(p, Z, H, Q_bar, N_bar, Qs, delta, t_start=1, return_R=False):
+    """Log-verosimilitud del ADCC ([a, b, g]) o del ADCC-H ([a, b, g, ω]), sumada desde t_start."""
+    fail = (PENALTY, None) if return_R else PENALTY
+    if not adcc_valid(p, Q_bar, N_bar, delta):
+        return fail
+    a, b, g, w = _adcc_unpack(p)
+    try:
+        contrib, R = _lik_from_Q(Z, _adcc_Q(Z, H, Q_bar, N_bar, Qs, a, b, g, w))
+    except np.linalg.LinAlgError:
+        return fail
+    c = contrib[t_start:]
+    if not np.all(np.isfinite(c)):
+        return fail
+    return (float(c.sum()), R) if return_R else float(c.sum())
+
+
+def estimate_adcc(Z, H, Q_bar, N_bar, Qs, delta, t_start, with_omega, starts):
+    """
+    MLE con SLSQP y varios puntos de partida. Los puntos de partida incluyen los
+    óptimos de los modelos anidados, y se conserva el mejor punto evaluado: así la
+    log-verosimilitud del modelo amplio nunca queda por debajo de la del anidado.
+    """
+    bounds = [(1e-6, 0.3), (0.5, 0.998), (0.0, 0.3)] + ([(0.0, 1.0)] if with_omega else [])
+    k = len(bounds)
+    lo, hi = np.array([bd[0] for bd in bounds]), np.array([bd[1] for bd in bounds])
+
+    def neg(p):
+        ll = adcc_loglik(p, Z, H, Q_bar, N_bar, Qs, delta, t_start)
+        return 1e10 if (not np.isfinite(ll) or ll <= PENALTY) else -ll
+
+    cons = ({'type': 'ineq', 'fun': lambda p: 0.998 - (p[0] + p[1] + delta * p[2])},
+            {'type': 'ineq', 'fun': lambda p: float(np.min(np.linalg.eigvalsh(
+                _adcc_intercept(Q_bar, N_bar, p[0], p[1], p[2])))) - 1e-6})
+    best_x, best_f = None, np.inf
+    for x0 in starts:
+        x0 = np.clip(np.asarray(x0, dtype=float)[:k], lo, hi)
+        f0 = neg(x0)
+        if f0 < best_f:
+            best_x, best_f = x0.copy(), f0
+        try:
+            res = minimize(neg, x0, method='SLSQP', bounds=bounds, constraints=cons,
+                           options={'maxiter': 500, 'ftol': 1e-9})
+        except Exception:
+            continue
+        if np.isfinite(res.fun) and res.fun < best_f and adcc_valid(res.x, Q_bar, N_bar, delta):
+            best_x, best_f = res.x.copy(), float(res.fun)
+    if best_x is None or best_f >= 1e9:
+        raise RuntimeError("La estimación del " + ("ADCC-H" if with_omega else "ADCC") +
+                           " no convergió desde ningún punto de partida.")
+    return best_x, -best_f
+
+
+def _lr_boundary(ll_u, ll_r):
+    """LR con corrección de frontera (½χ²(0) + ½χ²(1)): el parámetro agregado está en su cota 0."""
+    lr = max(0.0, 2 * (ll_u - ll_r))
+    return lr, (0.5 * float(chi2.sf(lr, 1)) if lr > 1e-10 else 1.0)
+
+
+def _fit_four_models(Z, H, Q_bar, Qs, t_start):
+    N_bar = asym_matrix(Z)
+    delta = asym_delta(Q_bar, N_bar)
+    rd = estimate_dcc_parameters(Z, H, Q_bar, Qs, 'DCC', t_start)
+    p_d, ll_d = np.asarray(rd.x, dtype=float), -rd.fun
+    rw = estimate_dcc_parameters(Z, H, Q_bar, Qs, 'DCC-H', t_start, restricted_params=p_d,
+                                 param='omega')
+    p_w, ll_w = np.asarray(rw.x, dtype=float), -rw.fun
+    p_a, ll_a = estimate_adcc(Z, H, Q_bar, N_bar, Qs, delta, t_start, False,
+                              [[p_d[0], p_d[1], 0.0], [p_d[0], p_d[1], 0.01],
+                               [max(p_d[0] - 0.005, 1e-4), p_d[1], 0.02]])
+    p_aw, ll_aw = estimate_adcc(Z, H, Q_bar, N_bar, Qs, delta, t_start, True,
+                                [[*p_a, 0.0], [*p_a, 0.05], [*p_a, 0.10],
+                                 [p_w[0], p_w[1], 0.0, p_w[2]], [p_w[0], p_w[1], p_a[2], p_w[2]]])
+    return {'N_bar': N_bar, 'delta': delta,
+            'DCC': (p_d, ll_d), 'DCC-H ω': (p_w, ll_w), 'ADCC': (p_a, ll_a), 'ADCC-H': (p_aw, ll_aw)}
+
+
+def asymmetry_comparison(Z, H, Q_bar, Qs, t_start=1):
+    """Estima DCC, ADCC, DCC-H con ω y ADCC-H, y los cuatro tests LR entre modelos anidados."""
+    H = np.asarray(H)
+    f = _fit_four_models(Z, H, Q_bar, Qs, t_start)
+    n_obs = len(Z) - max(t_start, 1)
+    rows = []
+    for name, key, k in (('DCC estándar', 'DCC', 2), ('ADCC (asimetría)', 'ADCC', 3),
+                         ('DCC-H con ω (salto directo)', 'DCC-H ω', 3),
+                         ('ADCC-H (asimetría + ω)', 'ADCC-H', 4)):
+        p, ll = f[key]
+        g = p[2] if key in ('ADCC', 'ADCC-H') else np.nan
+        w = p[3] if key == 'ADCC-H' else (p[2] if key == 'DCC-H ω' else np.nan)
+        rows.append({'Modelo': name, 'Parámetros': k, 'a': p[0], 'b': p[1], 'g (asimetría)': g,
+                     'ω (salto)': w, 'Log-verosimilitud': ll, 'AIC': -2 * ll + 2 * k,
+                     'BIC': -2 * ll + k * np.log(n_obs)})
+    tests = []
+    for name, comp, u, r in (('ω sin asimetría', 'DCC-H con ω contra DCC', 'DCC-H ω', 'DCC'),
+                             ('Asimetría sin ω', 'ADCC contra DCC', 'ADCC', 'DCC'),
+                             ('ω con la asimetría incluida (prueba decisiva)', 'ADCC-H contra ADCC',
+                              'ADCC-H', 'ADCC'),
+                             ('Asimetría con ω incluido', 'ADCC-H contra DCC-H con ω', 'ADCC-H',
+                              'DCC-H ω')):
+        lr, pv = _lr_boundary(f[u][1], f[r][1])
+        tests.append({'Prueba': name, 'Modelos comparados': comp, 'LR': lr, 'p asintótico': pv})
+    return {'modelos': pd.DataFrame(rows), 'tests': pd.DataFrame(tests), 'fits': f,
+            'lr_decisivo': tests[2]['LR'], 'p_decisivo': tests[2]['p asintótico'],
+            'n_obs': n_obs}
+
+
+def adcc_bootstrap_context(res, cfg, comp, reestimar_garch=True):
+    """Contexto para simular bajo el ADCC sin salto (ω = 0): la H0 de la prueba decisiva."""
+    ctx = bootstrap_context(res, cfg, reestimar_garch=reestimar_garch, volatilidad='garch')
+    Z = res['z_std'].values
+    a, b, g = [float(x) for x in comp['fits']['ADCC'][0]]
+    N_bar = comp['fits']['N_bar']
+    _, R = adcc_loglik([a, b, g], Z, np.zeros(len(Z), dtype=int), res['Q_bar'], N_bar, None,
+                       comp['fits']['delta'], 1, return_R=True)
+    ctx.update({'E': whitened_innovations(Z, R), 'a': a, 'b': b, 'g': g, 'N_bar': N_bar})
+    return ctx
+
+
+def simulate_adcc_restricted(rng, ctx, n_total):
+    """Simula (z, r) desde el ADCC sin salto, con GARCH por activo e innovaciones empíricas."""
+    E, a, b, g = ctx['E'], ctx['a'], ctx['b'], ctx['g']
+    Q_bar = ctx['Q_bar']
+    C0 = _adcc_intercept(Q_bar, ctx['N_bar'], a, b, g)
+    N = Q_bar.shape[0]
+    idx = rng.integers(0, len(E), n_total)
+    Z, r = np.empty((n_total, N)), np.empty((n_total, N))
+    Q_prev, s2 = Q_bar, np.asarray(ctx['sigma2_0'], dtype=float).copy()
+    for t in range(n_total):
+        if t == 0:
+            Q = Q_bar
+        else:
+            z1 = Z[t - 1]
+            n1 = z1 * (z1 < 0)
+            Q = C0 + a * np.outer(z1, z1) + g * np.outer(n1, n1) + b * Q_prev
+            s2 = ctx['omega'] + ctx['alpha'] * r[t - 1] ** 2 + ctx['beta'] * s2
+        d = np.sqrt(np.diag(Q))
+        Z[t] = np.linalg.cholesky(Q / np.outer(d, d)) @ E[idx[t]]
+        r[t] = np.sqrt(s2) * Z[t]
+        Q_prev = Q
+    return Z, r
+
+
+def adcc_bootstrap_replica(seed, ctx):
+    """Una réplica bajo el ADCC sin salto: repite el procedimiento completo y la prueba decisiva."""
+    rng = np.random.default_rng(seed)
+    Zs, rs = simulate_adcc_restricted(rng, ctx, len(ctx['index']))
+    ret = pd.DataFrame(rs, index=ctx['index'], columns=ctx['columns'])
+    if ctx['reestimar_garch']:
+        z_df, _, _, _ = garch_filter(ret)
+    else:
+        z_df = pd.DataFrame(Zs, index=ctx['index'], columns=ctx['columns'])
+    Q_bar_h = ensure_positive_definite(np.corrcoef(z_df.values.T), min_eig=1e-6)
+    _, _, _, _, H, _, Qs, active, _ = _stress_block(z_df, ret, ctx['cfg'], Q_bar_h)
+    Hv = H.values
+    n_inf = count_informative_days(Hv, active, ctx['t_start'])
+    if n_inf == 0:
+        return {'seed': seed, 'LR': 0.0, 'omega_hat': 0.0, 'dias_informativos': 0}
+    f = _fit_four_models(z_df.values, Hv, Q_bar_h, Qs, ctx['t_start'])
+    lr, _ = _lr_boundary(f['ADCC-H'][1], f['ADCC'][1])
+    return {'seed': seed, 'LR': lr, 'omega_hat': float(f['ADCC-H'][0][3]), 'dias_informativos': n_inf}
 
 
 # ============================================================================
@@ -1129,6 +1623,7 @@ def multi_spec_lr(z_df, stress_series, Q_bar, cfg, specs, t_start):
     Qs0 = np.broadcast_to(Q_bar, (T,) + Q_bar.shape)
     res_r = estimate_dcc_parameters(Z, H0, Q_bar, Qs0, 'DCC', t_start)
     ll_r = -res_r.fun
+    param = cfg.get('param_homeo', 'gamma')
     out, ind_cache = [], {}
     for a_g, k_g, cnt in specs:
         if a_g not in ind_cache:
@@ -1140,7 +1635,8 @@ def multi_spec_lr(z_df, stress_series, Q_bar, cfg, specs, t_start):
         if n_inf == 0:
             out.append({'LR': 0.0, 'n_inf': 0, 'gamma': 0.0, 'identificado': False})
             continue
-        res_u = estimate_dcc_parameters(Z, Hv, Q_bar, Qs, 'DCC-H', t_start, restricted_params=res_r.x)
+        res_u = estimate_dcc_parameters(Z, Hv, Q_bar, Qs, 'DCC-H', t_start, restricted_params=res_r.x,
+                                        param=param)
         out.append({'LR': max(0.0, 2 * (-res_u.fun - ll_r)), 'n_inf': n_inf,
                     'gamma': float(res_u.x[2]), 'identificado': True})
     return out
@@ -1151,7 +1647,8 @@ def romano_wolf_replica(seed, ctx, specs):
     rng = np.random.default_rng(seed)
     n = len(ctx['index'])
     Zs, rs = simulate_restricted(rng, ctx['E'], n, ctx['a'], ctx['b'], ctx['Q_bar'],
-                                 ctx['omega'], ctx['alpha'], ctx['beta'], ctx['sigma2_0'])
+                                 ctx['omega'], ctx['alpha'], ctx['beta'], ctx['sigma2_0'],
+                                 sigma_path=ctx.get('sigma_path'))
     ret = pd.DataFrame(rs, index=ctx['index'], columns=ctx['columns'])
     if ctx['reestimar_garch']:
         z_df, _, _, _ = garch_filter(ret)
@@ -1163,6 +1660,7 @@ def romano_wolf_replica(seed, ctx, specs):
     row = {'seed': seed}
     for i, r in enumerate(res):
         row[f'LR_{i}'] = r['LR']
+        row[f'INF_{i}'] = r['n_inf']      # [25] días informativos simulados
     return row
 
 
@@ -1336,13 +1834,14 @@ def out_of_sample_validation(returns, t0, cfg):
     n_inf_train = count_informative_days(H_tr, act_full[:t0], 1)
     if n_inf_train > 0:
         res_h = estimate_dcc_parameters(Z_tr, H_tr, Q_bar_tr, Qs_tr, 'DCC-H', 1,
-                                        restricted_params=res_s.x)
+                                        restricted_params=res_s.x,
+                                        param=cfg.get('param_homeo', 'gamma'))
         params_h = res_h.x
     else:
         params_h = np.r_[res_s.x, 0.0]
     params_s = np.r_[res_s.x, 0.0]
 
-    R_h, _ = dcc_filter(Z_full, H_arr, Q_bar_tr, Qs_full, params_h)
+    R_h, _ = dcc_filter(Z_full, H_arr, Q_bar_tr, Qs_full, params_h, cfg.get('param_homeo', 'gamma'))
     R_s, _ = dcc_filter(Z_full, H_arr, Q_bar_tr, Qs_full, params_s)
     conf = cfg['var_confidence']
     var_h = calculate_var(R_h[t0:], sigma_test, confidence=conf)
@@ -1388,10 +1887,11 @@ def run_pipeline_core(prices, cfg):
 
     t_start = max(t0, 1) if cfg['lik_scope'] == 'ventana' else 1
     Z = z_std.values
-    lr = likelihood_ratio_test(Z, H_t.values, Q_bar, Qs, active, t_start, compute_se=True)
+    param = cfg.get('param_homeo', 'gamma')
+    lr = likelihood_ratio_test(Z, H_t.values, Q_bar, Qs, active, t_start, compute_se=True, param=param)
     params_h = lr['params_unrestricted']
     params_s = np.r_[lr['params_restricted'][:2], 0.0]
-    R_h, _ = dcc_filter(Z, H_t.values, Q_bar, Qs, params_h)
+    R_h, _ = dcc_filter(Z, H_t.values, Q_bar, Qs, params_h, param)
     R_s, _ = dcc_filter(Z, H_t.values, Q_bar, Qs, params_s)
 
     conf = cfg['var_confidence']
@@ -1421,7 +1921,7 @@ def run_pipeline_core(prices, cfg):
 @st.cache_data(show_spinner=False, max_entries=10)
 def cached_pipeline(tickers, start, end, burn_years, confidence_gumbel, kappa, var_confidence,
                     gumbel_window, block_size, gumbel_method, min_obs_qs, lik_scope, enable_oos,
-                    stress_base='residuos', threshold_window='movil'):
+                    stress_base='residuos', threshold_window='movil', param_homeo='gamma'):
     dl_start = start - timedelta(days=int(round(365.25 * burn_years)))
     prices, err = download_data(tickers, dl_start, end + timedelta(days=1))
     if prices is None:
@@ -1430,7 +1930,7 @@ def cached_pipeline(tickers, start, end, burn_years, confidence_gumbel, kappa, v
                var_confidence=var_confidence, gumbel_window=gumbel_window,
                block_size=block_size, gumbel_method=gumbel_method, min_obs_qs=min_obs_qs,
                lik_scope=lik_scope, enable_oos=enable_oos, stress_base=stress_base,
-               threshold_window=threshold_window)
+               threshold_window=threshold_window, param_homeo=param_homeo)
     try:
         res = run_pipeline_core(prices, cfg)
     except Exception as e:
@@ -1532,7 +2032,8 @@ TICKERS_COMPLETE = ['^GSPC', '^STOXX50E', '^N225', '^VIX', 'TLT', 'HYG',
                     'GLD', 'USO', 'FXE', 'UUP', 'EEM', 'BTC-USD']
 PARAM_KEYS = ['tickers', 'start', 'end', 'burn_years', 'confidence_gumbel', 'kappa',
               'var_confidence', 'gumbel_window', 'block_size', 'gumbel_method',
-              'min_obs_qs', 'lik_scope', 'enable_oos', 'stress_base', 'threshold_window']
+              'min_obs_qs', 'lik_scope', 'enable_oos', 'stress_base', 'threshold_window',
+              'param_homeo']
 
 
 def sidebar_config():
@@ -1609,6 +2110,17 @@ def sidebar_config():
     scope_label = st.sidebar.radio("Verosimilitud DCC sobre",
                                    ["Solo la ventana de análisis", "Historia previa + ventana"])
     lik_scope = 'ventana' if scope_label.startswith("Solo") else 'completa'
+    param_label = st.sidebar.radio(
+        "Término homeostático",
+        ["γ (original; a+b+γ ≤ 0,998)", "λ ∈ [0,1] (fracción del objetivo que se desplaza)",
+         "ω ∈ [0,1] (salto directo hacia Q^(S))"],
+        index=1,
+        help="λ y γ actúan sobre el objetivo de largo plazo: Q_t = (1−a−b)·[(1−λH)·Q̄ + λH·Q^(S)] + "
+             "a·zz' + b·Q_{t−1}, con γ = λ(1−a−b); su efecto por día está limitado por el peso 1−a−b. "
+             "ω es otro canal: en tensión, Q_t = (1−ωH)·Q̃_t + ωH·Q^(S), y la correlación cierra una "
+             "fracción ω de la distancia a la estructura de estrés.")
+    param_homeo = ('gamma' if param_label.startswith("γ") else
+                   'omega' if param_label.startswith("ω") else 'lambda')
     var_confidence = st.sidebar.slider("Confianza VaR", 0.90, 0.99, 0.95, 0.01)
 
     st.sidebar.subheader("5. Validación")
@@ -1620,7 +2132,7 @@ def sidebar_config():
                var_confidence=round(float(var_confidence), 4), gumbel_window=int(gumbel_window),
                block_size=int(block_size), gumbel_method=gumbel_method, min_obs_qs=int(min_obs_qs),
                lik_scope=lik_scope, enable_oos=bool(enable_oos), stress_base=stress_base,
-               threshold_window=threshold_window)
+               threshold_window=threshold_window, param_homeo=param_homeo)
     return cfg, regime
 
 
@@ -1645,11 +2157,22 @@ def render_bootstrap(res, cfg, run_key):
     lr = res['lr']
     with st.expander("🔁 Bootstrap paramétrico del test LR (Sección 3.6.1)", expanded=True):
         st.caption(
-            "Simula muestras completas bajo H0 (γ = 0) con los parámetros estimados en TUS datos "
-            "(GARCH de cada activo, Q̄, a y b del DCC restringido) y remuestreo de las innovaciones "
+            f"Simula muestras completas bajo H0 ({PARAM_LABELS[cfg.get('param_homeo', 'gamma')]} = 0) "
+            "con los parámetros estimados en TUS datos "
+            "(volatilidad de cada activo, Q̄, a y b del DCC restringido) y remuestreo de las innovaciones "
             "empíricas. En cada réplica repite el procedimiento completo (GARCH → tensión → Q^(S) → "
             "LR). El p-value bootstrap es la proporción de réplicas con un LR al menos tan grande "
             "como el observado: no depende de la aproximación asintótica ½χ²(0)+½χ²(1).")
+        vol_label = st.selectbox(
+            "Volatilidad en las réplicas", ["GARCH simulado por activo (recomendado)", "Observada (experimental; distorsiona la distribución nula)"], key="boot_vol",
+            help="GARCH simulado: cada activo sigue un GARCH con los parámetros estimados; es el DGP "
+                 "coherente con el modelo. Observada: usa la volatilidad real; genera algo más de "
+                 "tensión conjunta, pero hace colapsar la distribución nula del LR (casi todos los LR* "
+                 "valen 0) y produce p-values artificialmente chicos. No usarla para inferencia.")
+        vol = 'observada' if vol_label.startswith("Observada") else 'garch'
+        if vol == 'observada':
+            st.warning("⚠️ Opción experimental: distorsiona la distribución nula y da p-values "
+                       "artificialmente chicos. Usala solo para documentar el diagnóstico.")
         c1, c2, c3 = st.columns(3)
         B = int(c1.selectbox("Réplicas (B)", [49, 99, 199, 499], index=2, key="boot_B",
                              help="199 da un p-value mínimo de 0,005; 499 es más preciso pero tarda "
@@ -1659,40 +2182,15 @@ def render_bootstrap(res, cfg, run_key):
         seed = int(c3.number_input("Semilla", 0, 2**31 - 1, 20260923, key="boot_seed"))
         seg = B * 0.75 * len(res['returns']) / 1000
         st.caption(f"Tiempo estimado ≈ {max(1, round(seg / 60))}–{max(1, round(1.5 * seg / 60))} min. "
-                   "No cierres ni recargues la pestaña mientras corre.")
-        boot_key = f"boot::{run_key}::{B}::{reest}::{seed}"
+                   "Si la página se interrumpe, el cálculo sigue solo desde la última réplica guardada.")
+        boot_key = f"boot::{run_key}::{B}::{reest}::{seed}::{vol}"
 
-        part_key = boot_key + "::parcial"
-        parcial = st.session_state.get(part_key)
-        if parcial and boot_key not in st.session_state:
-            st.info(f"⏸️ Hay {len(parcial)} de {B} réplicas ya calculadas de una ejecución interrumpida. "
-                    "Presioná *Ejecutar bootstrap* para continuar desde ahí.")
-
-        if st.button("▶️ Ejecutar bootstrap", key="boot_btn"):
-            ctx = bootstrap_context(res, cfg, reestimar_garch=reest)
-            seeds = np.random.SeedSequence(seed).generate_state(B)
-            # [21] La lista vive en session_state: cada réplica terminada queda guardada
-            # aunque Streamlit interrumpa el script, y el próximo clic continúa.
-            rows = st.session_state.setdefault(part_key, [])
-            hechas = len(rows)
-            bar, status = st.progress(hechas / B), st.empty()
-            t_ini = time.time()
-            for i in range(hechas, B):
-                sd = int(seeds[i])
-                try:
-                    rows.append(bootstrap_replica(sd, ctx))
-                except Exception as e:
-                    rows.append({'seed': sd, 'error': f"{type(e).__name__}: {e}"})
-                el, k = time.time() - t_ini, i + 1 - hechas
-                bar.progress((i + 1) / B)
-                status.caption(f"{i + 1}/{B} réplicas — {el / 60:.1f} min en esta ejecución, "
-                               f"≈ {el / k * (B - i - 1) / 60:.1f} min restantes")
-            st.session_state[boot_key] = pd.DataFrame(rows)
-            del st.session_state[part_key]
-
-        if boot_key not in st.session_state:
+        # [21][31] Reanudable: avance en la sesión y en disco, continuación automática.
+        bdf = run_resumable(boot_key, res, B, seed,
+                            lambda: bootstrap_context(res, cfg, reestimar_garch=reest, volatilidad=vol),
+                            bootstrap_replica, "▶️ Ejecutar bootstrap", "boot_btn")
+        if bdf is None:
             return
-        bdf = st.session_state[boot_key]
         ok = bdf[bdf['error'].isna()] if 'error' in bdf.columns else bdf
         n_fail = len(bdf) - len(ok)
         if len(ok) == 0:
@@ -1702,8 +2200,12 @@ def render_bootstrap(res, cfg, run_key):
         lr_obs = float(lr['lr_statistic'])
         p_boot = bootstrap_pvalue(lr_obs, LRb)
         crit95 = float(np.quantile(LRb, 0.95))
-        st.session_state[f"boot_p::{run_key}"] = (p_boot, len(ok))
+        st.session_state[f"boot_p::{run_key}"] = (p_boot, len(ok), vol)
 
+        if np.mean(LRb > 1e-8) < 0.2:
+            st.warning(f"⚠️ Solo el {np.mean(LRb > 1e-8):.0%} de las réplicas tiene LR* > 0 (la teoría "
+                       "asintótica espera ~50% y el bootstrap con GARCH simulado da ~40%). La distribución "
+                       "nula está degenerada y este p-value no es confiable.")
         c = st.columns(4)
         c[0].metric("p-value bootstrap", f"{p_boot:.4f}")
         c[1].metric("p-value asintótico", f"{lr['p_value']:.4f}")
@@ -1722,13 +2224,15 @@ def render_bootstrap(res, cfg, run_key):
                           xaxis_title="LR", yaxis_title="Réplicas", height=350, showlegend=False)
         st.plotly_chart(fig, use_container_width=True)
 
+        lab = PARAM_LABELS[cfg.get('param_homeo', 'gamma')]
         st.caption(f"{len(ok)} réplicas válidas · γ identificado en {ok['identificado'].mean():.0%} · "
-                   f"LR* > 0 en {np.mean(LRb > 1e-8):.0%} · γ̂* medio bajo H0 = "
-                   f"{ok['gamma_hat'].mean():.4f} (γ̂ observado = {lr['params_unrestricted'][2]:.4f}) · "
+                   f"LR* > 0 en {np.mean(LRb > 1e-8):.0%} · {lab}̂* medio bajo H0 = "
+                   f"{ok['gamma_hat'].mean():.4f} ({lab}̂ observado = {lr['params_unrestricted'][2]:.4f}) · "
                    f"resolución: el p-value mínimo posible es {1 / (len(ok) + 1):.4f}")
+        render_calibracion(ok['dias_informativos'].values, lr['n_informativos'])
         if p_boot < 0.05:
             st.success(f"Un LR como el observado aparece en menos del 5% de las muestras simuladas sin "
-                       f"efecto homeostático (p = {p_boot:.4f}): evidencia a favor de γ > 0 con esta "
+                       f"efecto homeostático (p = {p_boot:.4f}): evidencia a favor de {lab} > 0 con esta "
                        "especificación. Documentar en la tesis cuándo y por qué se eligió la definición "
                        "de tensión usada.")
         elif p_boot < 0.10:
@@ -1741,6 +2245,129 @@ def render_bootstrap(res, cfg, run_key):
                            key="boot_dl")
 
 
+def render_calibracion(dias_sim, dias_obs):
+    """[25] ¿El DGP del bootstrap genera tanta tensión como los datos reales?"""
+    dias_sim = np.asarray(dias_sim, dtype=float)
+    med = float(np.median(dias_sim))
+    q10, q90 = np.quantile(dias_sim, [0.1, 0.9])
+    pct_obs = 100 * float(np.mean(dias_sim <= dias_obs))
+    st.markdown(f"**Calibración del bootstrap:** días informativos observados = **{dias_obs}** · "
+                f"simulados: mediana **{med:.0f}** (percentiles 10–90: {q10:.0f}–{q90:.0f}); "
+                f"el valor observado supera al {pct_obs:.0f}% de las réplicas.")
+    if dias_obs > q90 or med < 0.7 * dias_obs:
+        st.warning("⚠️ Las muestras simuladas tienen bastante menos tensión que los datos reales. Con "
+                   "menos días informativos, los LR simulados tienden a ser menores, y el p-value "
+                   "bootstrap puede resultar demasiado optimista. Reportarlo como limitación.")
+    else:
+        st.caption("✓ La cantidad de tensión simulada es comparable con la observada.")
+
+
+def render_adcc(res, cfg, run_key):
+    """Sección 5d: contraste contra el DCC asimétrico (ADCC) y bootstrap de la prueba decisiva [29]."""
+    st.markdown("---")
+    st.markdown('<p class="sub-header">⚖️ 5d. Contraste contra el DCC asimétrico (ADCC)</p>',
+                unsafe_allow_html=True)
+    st.caption(
+        "Explicación alternativa: las correlaciones suben más después de caídas fuertes (ADCC; Cappiello, "
+        "Engle y Sheppard, 2006), y los días de tensión suelen ser días de caídas. Se estiman cuatro modelos "
+        "(DCC, ADCC, DCC-H con salto ω y ADCC-H con ambos). La prueba decisiva compara ADCC-H contra ADCC: "
+        "si ω sigue siendo significativo con la asimetría incluida, el efecto de la tensión no es solo esa "
+        "asimetría. Usa siempre el canal de salto directo (ω), cualquiera sea la parametrización elegida.")
+    lr = res['lr']
+    if not lr['identificado']:
+        st.info("El contraste requiere días informativos: el efecto no está identificado en esta corrida.")
+        return
+    key = f"adcc::{run_key}"
+    if st.button("▶️ Ejecutar contraste ADCC", key="adcc_btn"):
+        with st.spinner("Estimando DCC, ADCC, DCC-H con ω y ADCC-H (unos segundos)..."):
+            try:
+                Z, Hv = res['z_std'].values, res['H_t'].values
+                Qs, _ = compute_recursive_Qstress(Z, Hv, res['Q_bar'], cfg['min_obs_qs'])
+                st.session_state[key] = asymmetry_comparison(Z, Hv, res['Q_bar'], Qs, res['t_start'])
+            except Exception as e:
+                st.error(f"Error en el contraste ADCC: {e}")
+    comp = st.session_state.get(key)
+    if comp is None:
+        return
+
+    st.markdown("**Modelos estimados**")
+    st.dataframe(_fmt_df(comp['modelos'], {'a': '{:.4f}', 'b': '{:.4f}', 'g (asimetría)': '{:.4f}',
+                                           'ω (salto)': '{:.4f}', 'Log-verosimilitud': '{:.2f}',
+                                           'AIC': '{:.2f}', 'BIC': '{:.2f}'}), use_container_width=True)
+    st.markdown("**Tests de razón de verosimilitud** (corrección de frontera, valor crítico al 5%: 2,71)")
+    st.dataframe(_fmt_df(comp['tests'], {'LR': '{:.3f}', 'p asintótico': '{:.6f}'}),
+                 use_container_width=True)
+    t = comp['tests']
+    p_dec, lr_dec = comp['p_decisivo'], comp['lr_decisivo']
+    p_w, p_a = float(t.loc[0, 'p asintótico']), float(t.loc[1, 'p asintótico'])
+    if p_dec < 0.05:
+        st.success(f"Con la asimetría incluida en el modelo, el salto ω sigue siendo significativo "
+                   f"(LR = {lr_dec:.2f}, p = {p_dec:.6f}): el efecto de la tensión no es solo la respuesta "
+                   "asimétrica de las correlaciones a las caídas. Confirmar con el bootstrap de abajo.")
+    elif p_w < 0.05:
+        st.warning(f"ω es significativo sin la asimetría (p = {p_w:.6f}), pero deja de serlo cuando se la "
+                   f"incluye (p = {p_dec:.4f}): el efecto detectado podría ser la asimetría conocida de las "
+                   "correlaciones y no un mecanismo propio de la tensión.")
+    else:
+        st.info(f"ω no es significativo ni sin la asimetría (p = {p_w:.4f}) ni con ella (p = {p_dec:.4f}).")
+    st.caption(f"Asimetría por sí sola (ADCC contra DCC): p = {p_a:.6f}. Con colas pesadas el test "
+               "asintótico rechaza algo de más (Monte Carlo), así que la prueba decisiva se confirma con "
+               "el bootstrap.")
+
+    with st.expander("🔁 Bootstrap de la prueba decisiva (bajo el ADCC sin salto)", expanded=False):
+        st.caption("Simula muestras completas bajo un ADCC sin salto (ω = 0) con los parámetros estimados en "
+                   "tus datos, y en cada réplica repite el procedimiento completo: GARCH, tensión, Q^(S) y "
+                   "los cuatro modelos. El p-value es la proporción de réplicas con un LR de la prueba "
+                   "decisiva al menos tan grande como el observado.")
+        c1, c2, c3 = st.columns(3)
+        B = int(c1.selectbox("Réplicas (B)", [99, 199, 499], index=1, key="adcc_B"))
+        reest = c2.checkbox("Reestimar el GARCH en cada réplica", value=True, key="adcc_reest")
+        seed = int(c3.number_input("Semilla", 0, 2**31 - 1, 20261013, key="adcc_seed"))
+        seg = B * 2.4 * len(res['returns']) / 1000
+        st.caption(f"Tiempo estimado en una computadora ≈ {max(1, round(seg / 60))}–"
+                   f"{max(1, round(1.5 * seg / 60))} min. Si la página se interrumpe, el cálculo sigue "
+                   "solo desde la última réplica guardada.")
+        bkey = f"adccboot::{run_key}::{B}::{reest}::{seed}"
+        if run_resumable(bkey, res, B, seed,
+                         lambda: adcc_bootstrap_context(res, cfg, comp, reestimar_garch=reest),
+                         adcc_bootstrap_replica, "▶️ Ejecutar bootstrap de la prueba decisiva",
+                         "adcc_boot_btn") is None:
+            return
+        bdf = st.session_state[bkey]
+        ok = bdf[bdf['error'].isna()] if 'error' in bdf.columns else bdf
+        if len(ok) == 0:
+            st.error(f"Todas las réplicas fallaron. Primer error: {bdf['error'].dropna().iloc[0]}")
+            return
+        if len(ok) < len(bdf):
+            st.warning(f"{len(bdf) - len(ok)} réplica(s) fallaron y se excluyeron. Primer error: "
+                       f"{bdf['error'].dropna().iloc[0]}")
+        LRb = ok['LR'].values.astype(float)
+        p_boot = bootstrap_pvalue(lr_dec, LRb)
+        st.session_state[f"adcc_boot_p::{run_key}"] = (p_boot, len(ok))
+        c = st.columns(4)
+        c[0].metric("p-value bootstrap", f"{p_boot:.4f}")
+        c[1].metric("p-value asintótico", f"{p_dec:.6f}")
+        c[2].metric("LR observado", f"{lr_dec:.3f}")
+        c[3].metric("Valor crítico bootstrap (5%)", f"{float(np.quantile(LRb, 0.95)):.3f}")
+        if np.mean(LRb > 1e-8) < 0.2:
+            st.warning(f"Solo el {np.mean(LRb > 1e-8):.0%} de las réplicas tiene LR* > 0: la distribución "
+                       "nula está degenerada y este p-value no es confiable.")
+        st.caption(f"{len(ok)} réplicas válidas · LR* > 0 en {np.mean(LRb > 1e-8):.0%} · ω̂* medio bajo H0 = "
+                   f"{ok['omega_hat'].mean():.4f} · réplica con mayor LR: {LRb.max():.2f} · p-value mínimo "
+                   f"posible: {1 / (len(ok) + 1):.4f}")
+        render_calibracion(ok['dias_informativos'].values, lr['n_informativos'])
+        if p_boot < 0.05:
+            st.success(f"Un LR como el observado aparece en menos del 5% de las muestras simuladas con "
+                       f"asimetría y sin salto (p = {p_boot:.4f}): ω es significativo aun descontando la "
+                       "asimetría.")
+        else:
+            st.warning(f"Con la asimetría incluida, un LR como el observado es frecuente sin salto "
+                       f"(p = {p_boot:.4f}).")
+        st.download_button("📥 Réplicas del bootstrap ADCC (CSV)", bdf.to_csv(index=False),
+                           file_name=f"bootstrap_adcc_{datetime.now():%Y%m%d}.csv", mime="text/csv",
+                           key="adcc_boot_dl")
+
+
 def render_romano_wolf(res, cfg, run_key, a_sel, k_sel):
     """Interfaz del bootstrap de robustez con corrección de Romano-Wolf [23]."""
     lr = res['lr']
@@ -1748,7 +2375,7 @@ def render_romano_wolf(res, cfg, run_key, a_sel, k_sel):
     with st.expander("🔁 Bootstrap de robustez con corrección de Romano-Wolf", expanded=False):
         st.caption(
             "Evalúa TODAS las especificaciones (α, κ) seleccionadas arriba sobre cada muestra "
-            "simulada bajo H0 (γ=0). Da, para cada especificación, el p-value bootstrap individual y "
+            f"simulada bajo H0 ({PARAM_LABELS[cfg.get('param_homeo', 'gamma')]} = 0). Da, para cada especificación, el p-value bootstrap individual y "
             "el ajustado por Romano-Wolf, que controla la probabilidad de al menos un falso positivo "
             "respetando la correlación entre especificaciones. Incluye la especificación principal: "
             "su p-value individual sirve además como confirmación del bootstrap de la sección 5.")
@@ -1764,6 +2391,9 @@ def render_romano_wolf(res, cfg, run_key, a_sel, k_sel):
         if dup:
             st.caption("Equivalentes descartadas: " + ", ".join(f"α={a}, κ={k}" for a, k in dup))
 
+        vol_label = st.selectbox("Volatilidad en las réplicas", ["GARCH simulado por activo (recomendado)", "Observada (experimental; distorsiona la distribución nula)"], key="rw_vol",
+                                 help="Ver el bootstrap de la sección 5.")
+        vol = 'observada' if vol_label.startswith("Observada") else 'garch'
         c1, c2, c3 = st.columns(3)
         B = int(c1.selectbox("Réplicas (B)", [199, 499, 999], index=2, key="rw_B",
                              help="999 da un p-value mínimo de 0,001 y confirma el bootstrap de la "
@@ -1773,42 +2403,30 @@ def render_romano_wolf(res, cfg, run_key, a_sel, k_sel):
                                    help="Usá una semilla distinta de la del bootstrap de la sección 5."))
         seg = B * len(res['returns']) / 1000 * (0.9 + 0.18 * len(specs))
         st.caption(f"Tiempo estimado en una computadora ≈ {seg / 3600:.1f}–{1.5 * seg / 3600:.1f} h. "
-                   "Se puede interrumpir: al volver a presionar el botón continúa desde donde quedó.")
+                   "Si la página se interrumpe (un clic, la pestaña en segundo plano, la computadora "
+                   "suspendida), el cálculo sigue solo desde la última réplica guardada; con la "
+                   "computadora apagada o suspendida no avanza.")
 
         spec_sig = tuple((round(a, 4), c) for a, _, c in specs)
-        rw_key = f"rw::{run_key}::{spec_sig}::{B}::{reest}::{seed}"
-        part_key = rw_key + "::parcial"
-        parcial = st.session_state.get(part_key)
-        if parcial and rw_key not in st.session_state:
-            st.info(f"⏸️ Hay {len(parcial)} de {B} réplicas ya calculadas. Presioná el botón para continuar.")
+        rw_key = f"rw::{run_key}::{spec_sig}::{B}::{reest}::{seed}::{vol}"
+        prev = st.session_state.get(rw_key)
+        if isinstance(prev, dict):  # resultado guardado por la v2.11 en esta misma sesión
+            st.session_state[rw_key + "::obs"] = prev['obs']
+            st.session_state[rw_key] = prev['rows']
 
-        if st.button("▶️ Ejecutar bootstrap Romano-Wolf", key="rw_btn"):
-            with st.spinner("Calculando los LR observados de cada especificación..."):
-                obs = multi_spec_lr(res['z_std'], res['stress_series'], res['Q_bar'], cfg, specs,
-                                    res['t_start'])
-            ctx = bootstrap_context(res, cfg, reestimar_garch=reest)
-            seeds = np.random.SeedSequence(seed).generate_state(B)
-            rows = st.session_state.setdefault(part_key, [])
-            hechas = len(rows)
-            bar, status = st.progress(hechas / B), st.empty()
-            t_ini = time.time()
-            for i in range(hechas, B):
-                sd = int(seeds[i])
-                try:
-                    rows.append(romano_wolf_replica(sd, ctx, specs))
-                except Exception as e:
-                    rows.append({'seed': sd, 'error': f"{type(e).__name__}: {e}"})
-                el, k = time.time() - t_ini, i + 1 - hechas
-                bar.progress((i + 1) / B)
-                status.caption(f"{i + 1}/{B} réplicas — {el / 60:.1f} min en esta ejecución, "
-                               f"≈ {el / k * (B - i - 1) / 60:.0f} min restantes")
-            st.session_state[rw_key] = {'obs': obs, 'rows': pd.DataFrame(rows)}
-            del st.session_state[part_key]
-
-        if rw_key not in st.session_state:
+        # [31] Reanudable: avance en la sesión y en disco, continuación automática.
+        bdf = run_resumable(rw_key, res, B, seed,
+                            lambda: bootstrap_context(res, cfg, reestimar_garch=reest, volatilidad=vol),
+                            lambda sd, ctx: romano_wolf_replica(sd, ctx, specs),
+                            "▶️ Ejecutar bootstrap Romano-Wolf", "rw_btn")
+        if bdf is None:
             return
-        data = st.session_state[rw_key]
-        obs, bdf = data['obs'], data['rows']
+        obs_key = rw_key + "::obs"
+        if obs_key not in st.session_state:
+            with st.spinner("Calculando los LR observados de cada especificación..."):
+                st.session_state[obs_key] = multi_spec_lr(res['z_std'], res['stress_series'], res['Q_bar'],
+                                                          cfg, specs, res['t_start'])
+        obs = st.session_state[obs_key]
         ok = bdf[bdf['error'].isna()] if 'error' in bdf.columns else bdf
         if len(ok) == 0:
             st.error(f"Todas las réplicas fallaron. Primer error: {bdf['error'].dropna().iloc[0]}")
@@ -1825,19 +2443,40 @@ def render_romano_wolf(res, cfg, run_key, a_sel, k_sel):
             'Activos en tensión (mín.)': [c for _, _, c in specs],
             'Principal': ['★' if abs(a - cfg['confidence_gumbel']) < 1e-9 and c == main_cnt else ''
                           for a, _, c in specs],
-            'Días informativos': [o['n_inf'] for o in obs], 'γ̂': [o['gamma'] for o in obs],
+            'Días informativos': [o['n_inf'] for o in obs],
+            'Días inf. simulados (mediana)': [
+                float(np.median(ok[f'INF_{i}'])) if f'INF_{i}' in ok.columns else np.nan
+                for i in range(len(specs))],
+            '% réplicas sin identificar': [
+                100 * float(np.mean(ok[f'INF_{i}'] == 0)) if f'INF_{i}' in ok.columns else np.nan
+                for i in range(len(specs))],
+            f"{PARAM_LABELS[cfg.get('param_homeo', 'gamma')]}̂": [o['gamma'] for o in obs],
             'LR': lr_obs, 'p asintótico': p_asym, 'p bootstrap individual': p_ind,
             'p Romano-Wolf': p_rw})
-        st.dataframe(_fmt_df(tab, {'α Gumbel': '{:.2f}', 'κ': '{:.2f}', 'γ̂': '{:.4f}', 'LR': '{:.3f}',
+        lab_hat = f"{PARAM_LABELS[cfg.get('param_homeo', 'gamma')]}̂"
+        st.dataframe(_fmt_df(tab, {'α Gumbel': '{:.2f}', 'κ': '{:.2f}', lab_hat: '{:.4f}', 'LR': '{:.3f}',
+                                   'Días inf. simulados (mediana)': '{:.0f}',
+                                   '% réplicas sin identificar': '{:.0f}',
                                    'p asintótico': '{:.4f}', 'p bootstrap individual': '{:.4f}',
                                    'p Romano-Wolf': '{:.4f}'}), use_container_width=True)
+        if 'INF_0' in ok.columns:
+            ratio = [np.median(ok[f'INF_{i}']) / max(o['n_inf'], 1) for i, o in enumerate(obs)
+                     if o['n_inf'] > 0]
+            if ratio and min(ratio) < 0.7:
+                st.warning("⚠️ En algunas especificaciones las muestras simuladas tienen bastantes menos "
+                           "días informativos que los datos reales (ver las dos columnas de días). En esas "
+                           "especificaciones el DGP del bootstrap genera menos tensión conjunta que la "
+                           "real, y su p-value bootstrap individual puede ser demasiado optimista.")
+        else:
+            st.caption("Estas réplicas se calcularon con una versión anterior y no registran los días "
+                       "informativos simulados: volvé a ejecutar para ver el diagnóstico de calibración.")
         n_rw = int((p_rw < 0.05).sum())
         st.caption(f"{len(ok)} réplicas válidas · p-value mínimo posible: {1 / (len(ok) + 1):.4f}")
         main_idx = [i for i, (a, _, c) in enumerate(specs)
                     if abs(a - cfg['confidence_gumbel']) < 1e-9 and c == main_cnt]
         if main_idx:
             i = main_idx[0]
-            st.session_state[f"boot_p::{run_key}"] = (float(p_ind[i]), len(ok))
+            st.session_state[f"boot_p::{run_key}"] = (float(p_ind[i]), len(ok), vol)
             msg = (f"Especificación principal: p bootstrap individual = {p_ind[i]:.4f} · "
                    f"p Romano-Wolf = {p_rw[i]:.4f}.")
             (st.success if p_rw[i] < 0.05 else st.info)(msg)
@@ -1945,19 +2584,49 @@ def render_results(res, cfg, regime, run_key):
     # ---------------------------------------------------------------- 4. DCC-H
     st.markdown("---")
     st.markdown('<p class="sub-header">🔗 4. Correlación Dinámica (DCC-H)</p>', unsafe_allow_html=True)
-    a_h, b_h, g_h = lr['params_unrestricted'][:3]
-    c = st.columns(4)
+    param = cfg.get('param_homeo', 'gamma')
+    a_h, b_h, third_h = lr['params_unrestricted'][:3]
+    g_h = float(lr.get('gamma_efectivo', third_h))       # γ efectivo (= λ(1−a−b) con λ; NaN con ω)
+    lam_h = float(third_h) if param == 'lambda' else np.nan
+    om_h = float(third_h) if param == 'omega' else np.nan
+    c = st.columns(5)
     c[0].metric("a (shock)", f"{a_h:.4f}")
     c[1].metric("b (persistencia)", f"{b_h:.4f}")
-    c[2].metric("γ (homeostasis)", f"{g_h:.4f}")
-    c[3].metric("Días informativos para γ", lr['n_informativos'],
+    if param == 'omega':
+        c[2].metric("ω (salto directo)", f"{om_h:.4f}",
+                    help="Fracción de la distancia a la correlación de estrés que se cierra en cada día "
+                         "posterior a una tensión.")
+        c[3].metric("Persistencia en tensión = (1−ω)·b", f"{(1 - om_h) * b_h:.4f}")
+    elif param == 'lambda':
+        c[2].metric("λ (fracción del objetivo)", f"{lam_h:.4f}",
+                    help="Fracción del objetivo de largo plazo que en tensión se desplaza de Q̄ a Q^(S).")
+        c[3].metric("γ equivalente = λ(1−a−b)", f"{g_h:.5f}")
+    else:
+        c[2].metric("γ (homeostasis)", f"{g_h:.4f}")
+        c[3].metric("λ implícito = γ/(1−a−b)", f"{g_h / max(1 - a_h - b_h, 1e-12):.4f}",
+                    help="Fracción del objetivo que se desplaza. Con la parametrización γ, su máximo "
+                         "posible es (0,998−a−b)/(1−a−b), no 1.")
+    c[4].metric("Días informativos", lr['n_informativos'],
                 help="Días de la muestra de estimación con H_{t-1}=1 y Q^(S)_t distinto de Q̄. "
                      "Si es 0, γ no está identificado.")
     if not lr['identificado']:
         st.warning("⚠️ **γ no está identificado** en esta corrida: no hubo días con H_t=1 en los "
                    "que Q^(S) ya estuviera estimado (se necesitan al menos "
                    f"{cfg['min_obs_qs']} días de estrés previos). Se muestra el DCC estándar.")
-    elif lr['n_informativos'] < 10:
+    if lr.get('en_techo'):
+        if param == 'omega':
+            st.info("ℹ️ **ω̂ = 1**: la estimación pide que, tras cada día de tensión, la correlación "
+                    "salte por completo a la estructura de estrés. Es un borde natural del parámetro; "
+                    "revisá si tiene sentido económico antes de interpretarlo.")
+        elif param == 'lambda':
+            st.info("ℹ️ **λ̂ = 1**: la estimación pide que, en tensión, el objetivo de largo plazo sea "
+                    "por completo la correlación de estrés. Es un borde natural del parámetro (no un "
+                    "margen numérico), y el test LR y el bootstrap siguen siendo válidos.")
+        else:
+            st.warning("⚠️ **γ̂ está en el techo a+b+γ = 0,998**: su valor lo fija esa restricción, no "
+                       "los datos, y el LR depende de ese margen arbitrario. Usá la parametrización λ "
+                       "(barra lateral, sección 4) para estimar el efecto sin ese techo.")
+    if lr['identificado'] and lr['n_informativos'] < 10:
         st.info(f"ℹ️ Identificación débil: solo {lr['n_informativos']} días informativos para γ. "
                 "Los errores estándar pueden ser muy grandes; considerá estimar sobre historia "
                 "previa + ventana (Sección 4 de la barra lateral).")
@@ -1999,7 +2668,9 @@ def render_results(res, cfg, regime, run_key):
             est = np.asarray(lr['params_unrestricted'][:3])
             t_stat = np.where(se['frontera'], np.nan, est / se['se_sandwich'])
             se_df = pd.DataFrame({
-                'Parámetro': ['a (shock)', 'b (persistencia)', 'γ (homeostasis)'],
+                'Parámetro': ['a (shock)', 'b (persistencia)',
+                              {'lambda': 'λ (fracción del objetivo)', 'omega': 'ω (salto directo)'}
+                              .get(param, 'γ (homeostasis)')],
                 'Estimación': est, 'SE sandwich': se['se_sandwich'], 'SE OPG': se['se_opg'],
                 't (sandwich)': t_stat,
                 'En frontera': ['sí' if f else 'no' for f in se['frontera']]})
@@ -2013,11 +2684,12 @@ def render_results(res, cfg, regime, run_key):
                        "paramétrico (Sección 3.9).")
 
         if lr['decision'] == "RECHAZAR_H0":
-            st.success("La evidencia es compatible con H2 en este período y especificación: incluir γ "
-                       "mejora significativamente el ajuste respecto del DCC estándar. Reportar junto "
-                       "con el panel de robustez (5b).")
+            st.success(f"La evidencia es compatible con H2 en este período y especificación: incluir "
+                       f"{PARAM_LABELS[param]} mejora significativamente el ajuste respecto del DCC estándar. "
+                       "Reportar junto con el panel de robustez (5b) y el contraste contra el ADCC (5d).")
         else:
-            st.warning("No hay evidencia suficiente de γ>0 en este período con esta especificación. "
+            st.warning(f"No hay evidencia suficiente de {PARAM_LABELS[param]} > 0 en este período con esta "
+                       "especificación. "
                        "Es un resultado informativo en sí mismo. Si después de verlo se cambian α o κ, "
                        "el cambio debe declararse y corregirse por comparaciones múltiples (5b).")
 
@@ -2061,7 +2733,8 @@ def render_results(res, cfg, regime, run_key):
                     st.session_state[rob_key] = run_robustness_panel(
                         res['z_std'], res['stress_series'], res['loc_df'], res['scale_df'],
                         res['Q_bar'], t0,
-                        res['t_start'], a_sel, k_sel, cfg['min_obs_qs'])
+                        res['t_start'], a_sel, k_sel, cfg['min_obs_qs'],
+                        cfg.get('param_homeo', 'gamma'))
                 except Exception as e:
                     st.error(f"Error en el panel de robustez: {e}")
     if rob_key in st.session_state:
@@ -2086,17 +2759,32 @@ def render_results(res, cfg, regime, run_key):
 
     render_romano_wolf(res, cfg, run_key, a_sel, k_sel)
 
+    # ---------------------------------------------------------------- 5d. ADCC [29]
+    render_adcc(res, cfg, run_key)
+
     # ---------------------------------------------------------------- 6. Fase
     st.markdown("---")
     st.markdown('<p class="sub-header">🎯 6. Clasificación Automática de Fase</p>',
                 unsafe_allow_html=True)
     dias_ht_pct = float(H_win.mean() * 100)
-    fase_info = clasificar_fase(lr['p_value'], bt['kupiec_pvalue'], dias_ht_pct, lr['identificado'],
-                                n_informativos=lr['n_informativos'])
     if len(dates) > 3 * 252:
-        st.warning(f"⚠️ La ventana tiene {len(dates)} días (más de 3 años): probablemente contiene varios "
-                   "regímenes, y una única fase los promedia. Para clasificar fases usá ventanas acotadas "
-                   "a un episodio.")
+        # [27] Una ventana de varios años contiene varios regímenes: no es una fase.
+        fase_info = _fase(
+            'NO APLICA', 'Ventana demasiado larga para clasificar una fase', '#6c757d',
+            f'La ventana tiene {len(dates)} días (más de 3 años) y contiene varios regímenes; una única '
+            'fase los promediaría. Para clasificar fases usá ventanas acotadas a un episodio. Los '
+            'resultados de las secciones 4 y 5 (el test de H2) no se ven afectados.',
+            [f'– Ventana de {len(dates)} días'], ['• Clasificar fases con ventanas de un episodio'])
+    else:
+        fase_info = clasificar_fase(lr['p_value'], bt['kupiec_pvalue'], dias_ht_pct,
+                                    lr['identificado'], n_informativos=lr['n_informativos'])
+        if param in FRACTION_PARAMS:
+            sym = PARAM_LABELS[param]
+            for k_ in ('fase', 'subfase', 'descripcion', 'nota'):
+                if fase_info.get(k_):
+                    fase_info[k_] = fase_info[k_].replace('γ', sym)
+            for k_ in ('caracteristicas', 'recomendaciones'):
+                fase_info[k_] = [x.replace('γ', sym) for x in fase_info[k_]]
     mostrar_fase_detectada(fase_info)
 
     # ---------------------------------------------------------------- 7. VaR
@@ -2126,8 +2814,9 @@ def render_results(res, cfg, regime, run_key):
             c1.info(f"**Entrenamiento (historia previa):** {oos['train_period']} ({oos['n_train']} obs.)")
             c2.info(f"**Prueba (ventana):** {oos['test_period']} ({oos['n_test']} obs.)")
             if oos['n_inf_train'] == 0:
-                st.warning("γ no está identificado en el entrenamiento: el DCC-H coincide con el DCC "
-                           "estándar en la prueba (γ=0).")
+                _pl = PARAM_LABELS[cfg.get('param_homeo', 'gamma')]
+                st.warning(f"{_pl} no está identificado en el entrenamiento: el DCC-H coincide con el DCC "
+                           f"estándar en la prueba ({_pl} = 0).")
             bh_, bs_ = oos['bt_h'], oos['bt_s']
             tab = pd.DataFrame({
                 'Métrica': ['γ estimado (train)', 'Violaciones', 'Tasa observada', 'Tasa esperada',
@@ -2174,19 +2863,39 @@ def render_results(res, cfg, regime, run_key):
             'Umbral': cfg['threshold_window'], 'Método EVT': cfg['gumbel_method'],
             'α Gumbel': cfg['confidence_gumbel'], 'κ': cfg['kappa'],
             'Días H_t': int(H_win.sum()), '% H_t': round(dias_ht_pct, 2),
-            'Días informativos γ': lr['n_informativos'], 'γ': round(float(g_h), 4),
+            'Días informativos γ': lr['n_informativos'],
+            'Parametrización': PARAM_LABELS[param], 'γ': round(float(g_h), 5),
+            'λ': (round(lam_h, 4) if param == 'lambda' else
+                  np.nan if param == 'omega' else g_h / max(1 - a_h - b_h, 1e-12)),
+            'ω': round(om_h, 4) if param == 'omega' else np.nan,
+            'En techo': 'sí' if lr.get('en_techo') else 'no',
             'LR p corregido': lr['p_value'], 'Kupiec p': round(bt['kupiec_pvalue'], 4),
             'Fase': fase_info['fase']}
     boot_p = st.session_state.get(f"boot_p::{run_key}")
     if boot_p is not None:
         hist[run_key]['LR p bootstrap'] = boot_p[0]
         hist[run_key]['B bootstrap'] = boot_p[1]
+        hist[run_key]['Volatilidad bootstrap'] = boot_p[2] if len(boot_p) > 2 else 'garch'
+    adcc_res = st.session_state.get(f"adcc::{run_key}")        # [29]
+    if adcc_res is not None:
+        hist[run_key]['LR ω | ADCC'] = adcc_res['lr_decisivo']
+        hist[run_key]['p ω | ADCC'] = adcc_res['p_decisivo']
+    adcc_bp = st.session_state.get(f"adcc_boot_p::{run_key}")
+    if adcc_bp is not None:
+        hist[run_key]['p boot ω | ADCC'] = adcc_bp[0]
     hist_df = pd.DataFrame(list(hist.values()))
     if 'LR p bootstrap' in hist_df.columns:
         hist_df['LR p bootstrap'] = hist_df['LR p bootstrap'].map(
             lambda v: '—' if pd.isna(v) else f"{v:.4f}")
         hist_df['B bootstrap'] = hist_df['B bootstrap'].map(lambda v: '—' if pd.isna(v) else int(v))
-    st.dataframe(_fmt_df(hist_df, {'LR p corregido': '{:.6f}', 'γ': '{:.4f}', '% H_t': '{:.2f}',
+        hist_df['Volatilidad bootstrap'] = hist_df['Volatilidad bootstrap'].fillna('—')
+    # [28] γ, λ y ω no se definen en todas las parametrizaciones: '—' en lugar de 'no identificado'
+    for col_, f_ in (('γ', '{:.5f}'), ('λ', '{:.4f}'), ('ω', '{:.4f}'), ('LR ω | ADCC', '{:.3f}'),
+                     ('p ω | ADCC', '{:.6f}'), ('p boot ω | ADCC', '{:.4f}')):
+        if col_ in hist_df.columns:
+            hist_df[col_] = hist_df[col_].map(lambda v, f_=f_: '—' if pd.isna(v) else f_.format(v))
+    st.dataframe(_fmt_df(hist_df, {'LR p corregido': '{:.6f}',
+                                   '% H_t': '{:.2f}',
                                    'α Gumbel': '{:.3f}', 'κ': '{:.2f}', 'Kupiec p': '{:.4f}'},
                          na_rep='no identificado'),
                  use_container_width=True)
@@ -2213,7 +2922,11 @@ def render_results(res, cfg, regime, run_key):
                'Confianza Gumbel': cfg['confidence_gumbel'], 'Umbral κ': cfg['kappa'],
                'Días H_t': int(H_win.sum()), '% H_t': f"{dias_ht_pct:.2f}%",
                'Días informativos γ': lr['n_informativos'],
-               'a': a_h, 'b': b_h, 'γ': g_h, 'LR': lr['lr_statistic'],
+               'Parametrización': PARAM_LABELS[param], 'a': a_h, 'b': b_h, 'γ efectivo': g_h,
+               'λ': (lam_h if param == 'lambda' else
+                     np.nan if param == 'omega' else g_h / max(1 - a_h - b_h, 1e-12)),
+               'ω': om_h,
+               'En techo': bool(lr.get('en_techo')), 'LR': lr['lr_statistic'],
                'LR p corregido': lr['p_value'], 'Decisión LR': lr['decision'],
                'Violaciones VaR': bt['violations'], 'Kupiec p': bt['kupiec_pvalue'],
                'Fase': fase_info['fase']}
