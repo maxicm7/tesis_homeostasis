@@ -1,4 +1,4 @@
-# ============================================================================
+ ============================================================================
 # 🎲 ESTUDIO MONTE CARLO DEL ESTIMADOR DCC-H (Sección 3.9 de la tesis)
 # ============================================================================
 # Archivo: montecarlo_dcch.py
@@ -6,6 +6,16 @@
 #           estimador directamente de la app, de modo que lo que se valida es
 #           exactamente el código que produce los resultados empíricos.
 #
+# Versión 1.4: canal de salto directo (--param omega), igual que la app v2.10:
+#   Q̃_t = (1−a−b)·Q̄ + a·zz' + b·Q_{t−1};  Q_t = (1−ω·H_{t−1})·Q̃_t + ω·H_{t−1}·Q^(S),  ω ∈ [0,1].
+#   Sirve para medir la potencia del test con este canal ANTES de estimarlo con datos reales:
+#     python montecarlo_dcch.py --param omega --valores 0 0.05 0.10 --reps 100 --out mc_omega
+#   Requiere la app v2.10 o posterior.
+# Versión 1.3: parametrización λ (la del resultado principal de la tesis):
+#   Q_t = (1−a−b)·[(1−λH)·Q̄ + λH·Q^(S)] + a·zz' + b·Q_{t−1}, λ ∈ [0,1], γ = λ(1−a−b).
+#   Simula con el λ verdadero y estima con λ, igual que la app v2.7+. Los valores por
+#   defecto reproducen la muestra 2008–2026 (a=0.020, b=0.969, T=4836, historia=782).
+#   --lr-obs informa qué fracción de réplicas bajo H0 supera el LR observado.
 # Versión 1.2: la tensión del DGP puede definirse como SORPRESA (|z|) o como
 # ESTADO (|r|, retornos con volatilidad GARCH), con umbral móvil o expansivo,
 # igual que en la app v2.2+. Requiere app v2.2 o posterior.
@@ -111,12 +121,16 @@ def _load_estimator():
             import inspect
             if 'expanding' not in inspect.signature(mod.gumbel_rolling_params).parameters:
                 missing = ['gumbel_rolling_params(expanding=...) de la v2.2']
+            elif 'param' not in inspect.signature(mod.likelihood_ratio_test).parameters:
+                missing = ['likelihood_ratio_test(param=...) de la v2.7 (parametrización λ)']
+            elif 'omega' not in getattr(mod, 'PARAM_LABELS', {}):
+                missing = ['el canal de salto directo ω de la v2.10']
         if not missing:
             return mod
         tried.append(f"- {name}.py ({getattr(mod, '__file__', '?')}): es una VERSIÓN ANTERIOR "
                      f"de la app; le faltan: {', '.join(missing)}")
     raise ImportError(
-        "El Monte Carlo necesita la app v2.2 o posterior en la misma carpeta, con el nombre "
+        "El Monte Carlo necesita la app v2.10 o posterior en la misma carpeta, con el nombre "
         "app_tesis.py (o app_tesis_fase_mercado.py). Se buscó:\n" + "\n".join(tried) +
         "\nReemplazá ese archivo por la última versión de la app y volvé a ejecutar.")
 
@@ -137,23 +151,31 @@ except ImportError as _err:
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(description="Monte Carlo del estimador DCC-H (Sección 3.9)")
-    p.add_argument('--gammas', type=float, nargs='+', default=[0.0, 0.03, 0.07],
-                   help="γ verdaderos (con a=0.02, b=0.90 debe ser γ < 0.079)")
-    p.add_argument('--T', type=int, nargs='+', default=[252, 1000, 4000],
-                   help="Largos de la ventana (4000 ≈ muestra larga 2008–hoy)")
+    p.add_argument('--param', choices=['lambda', 'omega', 'gamma'], default='lambda',
+                   help="Canal del efecto: lambda (objetivo de largo plazo), omega (salto directo) "
+                        "o gamma (parametrización original)")
+    p.add_argument('--valores', type=float, nargs='+', default=None,
+                   help="Valores verdaderos del parámetro. Por defecto: λ ∈ {0; 0,5; 1}, "
+                        "ω ∈ {0; 0,05; 0,10}, γ ∈ {0; 0,005}")
+    p.add_argument('--gammas', type=float, nargs='+', default=None,
+                   help="(compatibilidad) equivale a --param gamma --valores ...")
+    p.add_argument('--lr-obs', type=float, default=2.745,
+                   help="LR observado en los datos reales, para comparar con las réplicas bajo H0")
+    p.add_argument('--T', type=int, nargs='+', default=[4836],
+                   help="Largos de la ventana (4836 = muestra 2008-01-02 a 2026-09-23)")
     p.add_argument('--reps', type=int, default=200, help="Réplicas por combinación (γ, T)")
-    p.add_argument('--hist', type=int, default=756, help="Días de historia previa (burn-in)")
+    p.add_argument('--hist', type=int, default=782, help="Días de historia previa (burn-in)")
     p.add_argument('--N', type=int, default=6, help="Número de activos")
-    p.add_argument('--a', type=float, default=0.02)
-    p.add_argument('--b', type=float, default=0.90)
+    p.add_argument('--a', type=float, default=0.020, help="a verdadero (estimado: 0,0200)")
+    p.add_argument('--b', type=float, default=0.969, help="b verdadero (estimado: 0,9692)")
     p.add_argument('--rho-bar', type=float, default=0.30, help="Correlación de Q̄")
     p.add_argument('--rho-s', type=float, default=0.70, help="Correlación de Q^(S)")
     p.add_argument('--tension', choices=['estado', 'sorpresa'], default='estado',
                    help="Serie para H_t: estado = retornos |r|; sorpresa = residuos |z|")
     p.add_argument('--umbral', choices=['expansiva', 'movil'], default='expansiva',
                    help="Ventana del umbral de Gumbel")
-    p.add_argument('--garch-alpha', type=float, default=0.08, help="α del GARCH de los retornos")
-    p.add_argument('--garch-beta', type=float, default=0.90, help="β del GARCH de los retornos")
+    p.add_argument('--garch-alpha', type=float, default=0.10, help="α del GARCH de los retornos")
+    p.add_argument('--garch-beta', type=float, default=0.88, help="β del GARCH de los retornos")
     p.add_argument('--vol', type=float, default=0.01, help="Volatilidad diaria incondicional")
     p.add_argument('--nu', type=float, default=5.0,
                    help="Grados de libertad de la t multivariada (0 = normal)")
@@ -166,7 +188,13 @@ def parse_args(argv=None):
     p.add_argument('--workers', type=int, default=max(1, (os.cpu_count() or 2) - 1),
                    help="Procesos en paralelo")
     p.add_argument('--out', type=str, default='resultados_montecarlo', help="Carpeta de salida")
-    return p.parse_args(argv)
+    args = p.parse_args(argv)
+    if args.gammas is not None:          # compatibilidad con versiones anteriores
+        args.param, args.valores = 'gamma', args.gammas
+    if args.valores is None:
+        args.valores = {'lambda': [0.0, 0.5, 1.0], 'omega': [0.0, 0.05, 0.10],
+                        'gamma': [0.0, 0.005]}[args.param]
+    return args
 
 
 def equicorr(N, rho):
@@ -199,12 +227,14 @@ def _gumbel_threshold_from_window(window_abs, block, alpha):
     return loc - scale * np.log(-np.log(alpha))
 
 
-def simulate_dcch(rng, T_total, gamma, cfg):
+def simulate_dcch(rng, T_total, gamma, cfg, jump=0.0):
     """
     Simula z_t (T_total x N), los retornos r_t = σ_t·z_t (GARCH por activo) y el
     H_t verdadero del DCC-H con innovaciones t multivariadas estandarizadas.
     H_t se determina con la regla de la app (causal) sobre |r| (estado) o |z|
     (sorpresa), con umbral móvil o expansivo.
+    jump = ω del canal de salto directo: tras un día de tensión,
+    Q_t = (1−ω)·Q̃_t + ω·Q^(S) (Q^(S) verdadera, equicorrelacionada).
     """
     N, a, b = cfg['N'], cfg['a'], cfg['b']
     Q_bar, Q_S = equicorr(N, cfg['rho_bar']), equicorr(N, cfg['rho_s'])
@@ -232,6 +262,8 @@ def simulate_dcch(rng, T_total, gamma, cfg):
                 Q_t = (1 - a - b - gamma) * Q_bar + a * zz + b * Q_prev + gamma * Q_S
             else:
                 Q_t = (1 - a - b) * Q_bar + a * zz + b * Q_prev
+            if jump > 0 and H[t - 1] == 1:            # salto directo hacia Q^(S)
+                Q_t = (1 - jump) * Q_t + jump * Q_S
         d = np.sqrt(np.diag(Q_t))
         R_t = Q_t / np.outer(d, d)
 
@@ -273,19 +305,26 @@ def estimate_replica(Z, Rr, t0, cfg):
     Hv = H_hat.values
     Q_bar_hat = A.ensure_positive_definite(np.corrcoef(Z.T), min_eig=1e-6)
     Qs, active = A.compute_recursive_Qstress(Z, Hv, Q_bar_hat, cfg['min_obs'])
-    lr = A.likelihood_ratio_test(Z, Hv, Q_bar_hat, Qs, active, t_start=t0, compute_se=False)
+    lr = A.likelihood_ratio_test(Z, Hv, Q_bar_hat, Qs, active, t_start=t0, compute_se=False,
+                                 param=cfg['param'])
     return Hv, lr
 
 
 def run_replica(task):
     """Una réplica (se ejecuta en un proceso aparte)."""
-    gamma, T, rep, seed, cfg = task
+    theta, T, rep, seed, cfg = task
     rng = np.random.default_rng(seed)
     t0 = cfg['hist']
     t_start = time.time()
-    row = {'gamma_true': gamma, 'T': T, 'rep': rep, 'seed': seed}
+    # γ efectivo del DGP: con λ, γ = λ(1−a−b); con ω, el efecto entra por el salto directo
+    param = cfg['param']
+    gamma = (theta * (1 - cfg['a'] - cfg['b']) if param == 'lambda' else
+             0.0 if param == 'omega' else theta)
+    jump = theta if param == 'omega' else 0.0
+    row = {'valor_verdadero': theta, 'gamma_efectivo_verdadero': gamma, 'T': T, 'rep': rep,
+           'seed': seed}
     try:
-        Z, Rr, H_true = simulate_dcch(rng, t0 + T, gamma, cfg)
+        Z, Rr, H_true = simulate_dcch(rng, t0 + T, gamma, cfg, jump=jump)
         H_hat, lr = estimate_replica(Z, Rr, t0, cfg)
         pu = np.asarray(lr['params_unrestricted'], dtype=float)
         row.update({
@@ -295,7 +334,9 @@ def run_replica(task):
             'dias_Ht_ventana': int(H_hat[t0:].sum()),
             'dias_informativos': int(lr['n_informativos']),
             'identificado': bool(lr['identificado']),
-            'a_hat': pu[0], 'b_hat': pu[1], 'gamma_hat': pu[2],
+            'a_hat': pu[0], 'b_hat': pu[1], 'param_hat': pu[2],
+            'gamma_hat': float(lr.get('gamma_efectivo', pu[2])),
+            'en_techo': bool(lr.get('en_techo', False)),
             'LR': lr['lr_statistic'], 'p_corregido': lr['p_value'],
             'rechaza_H0': bool(lr['identificado'] and lr['p_value'] < 0.05),
             'error': '',
@@ -324,15 +365,18 @@ def summarize(df):
     if 'identificado' not in df.columns or not df['ok'].astype(bool).any():
         return None
     out = []
-    for (g, T), d in df.groupby(['gamma_true', 'T']):
+    param = df.attrs.get('param', 'lambda')
+    lr_obs = df.attrs.get('lr_obs')
+    for (g, T), d in df.groupby(['valor_verdadero', 'T']):
         ok = d[d['ok'].astype(bool)]
         ident = ok[ok['identificado'].astype(bool)]
         n, n_id = len(ok), len(ident)
         rej = ok['rechaza_H0'].astype(bool).mean() if n else np.nan
         rej_id = ident['rechaza_H0'].astype(bool).mean() if n_id else np.nan
-        err = ident['gamma_hat'] - g
+        err = ident['param_hat'] - g
+        lr_all = ok['LR'].fillna(0.0).values
         out.append({
-            'gamma_verdadero': g, 'T_ventana': T, 'replicas_ok': n,
+            'parametro': param, 'valor_verdadero': g, 'T_ventana': T, 'replicas_ok': n,
             'replicas_fallidas': int((~d['ok'].astype(bool)).sum()),
             'pct_identificado': 100 * n_id / n if n else np.nan,
             'dias_Ht_ventana_media': ok['dias_Ht_ventana'].mean(),
@@ -341,11 +385,16 @@ def summarize(df):
             'tasa_rechazo_total': rej,
             'tasa_rechazo_ES_MC': np.sqrt(rej * (1 - rej) / n) if n else np.nan,
             'tasa_rechazo_identificadas': rej_id,
-            'gamma_hat_media': ident['gamma_hat'].mean() if n_id else np.nan,
-            'gamma_hat_mediana': ident['gamma_hat'].median() if n_id else np.nan,
-            'sesgo_gamma': err.mean() if n_id else np.nan,
-            'RMSE_gamma': np.sqrt((err ** 2).mean()) if n_id else np.nan,
-            'pct_gamma_hat_en_0': 100 * (ident['gamma_hat'] < 1e-4).mean() if n_id else np.nan,
+            'pct_LR_positivo': 100 * float(np.mean(lr_all > 1e-8)) if n else np.nan,
+            'LR_percentil_95': float(np.quantile(lr_all, 0.95)) if n else np.nan,
+            'pct_LR_mayor_o_igual_obs': (100 * float(np.mean(lr_all >= lr_obs - 1e-12))
+                                         if (n and lr_obs is not None) else np.nan),
+            'estimado_media': ident['param_hat'].mean() if n_id else np.nan,
+            'estimado_mediana': ident['param_hat'].median() if n_id else np.nan,
+            'sesgo': err.mean() if n_id else np.nan,
+            'RMSE': np.sqrt((err ** 2).mean()) if n_id else np.nan,
+            'pct_estimado_en_0': 100 * (ident['param_hat'] < 1e-4).mean() if n_id else np.nan,
+            'pct_en_techo': 100 * ident['en_techo'].astype(bool).mean() if n_id else np.nan,
             'sesgo_a': (ok['a_hat'] - float(df.attrs.get('a', np.nan))).mean(),
             'sesgo_b': (ok['b_hat'] - float(df.attrs.get('b', np.nan))).mean(),
             'H_coincide_DGP_pct': 100 * ok['H_coincide_DGP'].astype(bool).mean() if n else np.nan,
@@ -356,8 +405,10 @@ def summarize(df):
 def summary_lines(summ):
     lines = []
     for _, r in summ.iterrows():
-        tipo = "TAMAÑO (γ=0: debería ser ≈ 5%)" if r['gamma_verdadero'] == 0 else "POTENCIA"
-        lines.append(f"\nγ = {r['gamma_verdadero']:.2f} | T = {int(r['T_ventana'])} | réplicas = "
+        sym = {'lambda': 'λ', 'omega': 'ω'}.get(r.get('parametro', 'lambda'), 'γ')
+        tipo = f"TAMAÑO ({sym}=0: debería ser ≈ 5%)" if r['valor_verdadero'] == 0 else "POTENCIA"
+        fmt = '.2f' if sym in ('λ', 'ω') else '.4f'
+        lines.append(f"\n{sym} = {r['valor_verdadero']:{fmt}} | T = {int(r['T_ventana'])} | réplicas = "
               f"{int(r['replicas_ok'])} (fallidas: {int(r['replicas_fallidas'])})")
         if not r['replicas_ok']:
             continue
@@ -368,12 +419,16 @@ def summary_lines(summ):
         lines.append(f"  {tipo}: tasa de rechazo = {100 * r['tasa_rechazo_total']:.1f}% "
               f"(± {196 * r['tasa_rechazo_ES_MC']:.1f} pp al 95%); entre identificadas: "
               f"{100 * r['tasa_rechazo_identificadas']:.1f}%")
-        if np.isfinite(r['sesgo_gamma']):
-            lines.append(f"  γ̂: media {r['gamma_hat_media']:.4f} | mediana {r['gamma_hat_mediana']:.4f} | "
-                  f"sesgo {r['sesgo_gamma']:+.4f} | RMSE {r['RMSE_gamma']:.4f} | "
-                  f"γ̂≈0 en {r['pct_gamma_hat_en_0']:.0f}%")
+        lines.append(f"  LR > 0 en {r['pct_LR_positivo']:.0f}% de las réplicas | percentil 95 del LR = "
+                     f"{r['LR_percentil_95']:.2f}"
+                     + (f" | LR ≥ observado en {r['pct_LR_mayor_o_igual_obs']:.1f}%"
+                        if np.isfinite(r['pct_LR_mayor_o_igual_obs']) else ""))
+        if np.isfinite(r['sesgo']):
+            lines.append(f"  {sym}̂: media {r['estimado_media']:.4f} | mediana {r['estimado_mediana']:.4f} | "
+                  f"sesgo {r['sesgo']:+.4f} | RMSE {r['RMSE']:.4f} | {sym}̂≈0 en "
+                  f"{r['pct_estimado_en_0']:.0f}% | en el techo en {r['pct_en_techo']:.0f}%")
     lines.append("\nNota: 'tasa de rechazo total' cuenta las réplicas sin identificar como no "
-                 "rechazo, que es lo que ocurre en la práctica cuando la app informa 'γ no identificado'.")
+                 "rechazo, que es lo que ocurre en la práctica cuando la app informa 'no identificado'.")
     return lines
 
 
@@ -394,19 +449,27 @@ def build_cfg(args):
            'tension': args.tension, 'umbral': args.umbral, 'garch_alpha': args.garch_alpha,
            'garch_beta': args.garch_beta, 'vol': args.vol,
            'gumbel_window': args.gumbel_window, 'block': args.block, 'min_obs': args.min_obs,
-           'hist': args.hist}
+           'hist': args.hist, 'param': args.param}
     if args.garch_alpha + args.garch_beta >= 1:
         raise ValueError("El GARCH de los retornos debe ser estacionario: α + β < 1.")
-    bad = [g for g in args.gammas if args.a + args.b + g >= 0.999]
-    if bad:
-        raise ValueError(f"a + b + γ debe ser < 0.999; revisá γ = {bad} (con a={args.a}, b={args.b} "
-                         f"el máximo es γ < {0.999 - args.a - args.b:.3f}).")
+    if args.a + args.b >= 0.999:
+        raise ValueError("a + b debe ser < 0.999.")
+    if args.param in ('lambda', 'omega'):
+        sym = 'λ' if args.param == 'lambda' else 'ω'
+        bad = [v for v in args.valores if not 0 <= v <= 1]
+        if bad:
+            raise ValueError(f"{sym} debe estar entre 0 y 1; revisá {bad}.")
+    else:
+        bad = [g for g in args.valores if args.a + args.b + g >= 0.999]
+        if bad:
+            raise ValueError(f"a + b + γ debe ser < 0.999; revisá γ = {bad} (con a={args.a}, "
+                             f"b={args.b} el máximo es γ < {0.999 - args.a - args.b:.4f}).")
     return cfg
 
 
 def build_tasks(args, cfg):
     """Semillas independientes y reproducibles por réplica."""
-    combos = [(g, T) for g in args.gammas for T in args.T]
+    combos = [(g, T) for g in args.valores for T in args.T]
     seeds = np.random.SeedSequence(args.seed).spawn(len(combos) * args.reps)
     tasks, k = [], 0
     for g, T in combos:
@@ -417,7 +480,8 @@ def build_tasks(args, cfg):
 
 
 def collect(rows, args):
-    df = pd.DataFrame(rows).sort_values(['gamma_true', 'T', 'rep']).reset_index(drop=True)
+    df = pd.DataFrame(rows).sort_values(['valor_verdadero', 'T', 'rep']).reset_index(drop=True)
+    df.attrs['param'], df.attrs['lr_obs'] = args.param, args.lr_obs
     df.attrs['a'], df.attrs['b'] = args.a, args.b
     return df, summarize(df), error_report(df)
 
@@ -434,7 +498,7 @@ def main(argv=None):
                   ensure_ascii=False)
     tasks = build_tasks(args, cfg)
 
-    print(f"Monte Carlo DCC-H: {len(tasks)} réplicas ({len(args.gammas)} γ × {len(args.T)} T × "
+    print(f"Monte Carlo DCC-H: {len(tasks)} réplicas ({len(args.valores)} valores de {args.param} × {len(args.T)} T × "
           f"{args.reps}), con {args.workers} proceso(s).\nEstimador: {A.__file__}\n"
           f"Resultados en '{args.out}/'.")
     t_ini = time.time()
@@ -501,15 +565,36 @@ def streamlit_main():
             "corre: Streamlit detiene la ejecución. Para miles de réplicas, usá la terminal.")
 
     d = parse_args([])
-    max_g = round(0.999 - d.a - d.b - 0.001, 3)
+    st.caption("Los valores por defecto reproducen tu muestra larga: parametrización λ, a = 0,020, "
+               "b = 0,969, ventana de 4836 días y 782 de historia previa.")
+    param_label = st.radio("Canal del efecto",
+                           ["λ: objetivo de largo plazo", "ω: salto directo hacia Q^(S)", "γ (original)"],
+                           horizontal=True)
+    param = ('lambda' if param_label.startswith("λ") else
+             'omega' if param_label.startswith("ω") else 'gamma')
     c1, c2, c3 = st.columns(3)
-    gammas = c1.multiselect("γ verdaderos", [0.0, 0.01, 0.03, 0.05, 0.07], default=[0.0, 0.03, 0.07],
-                            help=f"Con a={d.a} y b={d.b}, la restricción a+b+γ<1 exige γ ≤ {max_g}.")
-    Ts = c2.multiselect("Largos de ventana T (días)", [126, 252, 504, 1000, 2000, 4000],
-                        default=[252, 1000, 4000],
-                        help="4000 ≈ la muestra larga 2008–hoy. Las ventanas largas tardan más.")
-    reps = int(c3.number_input("Réplicas por combinación", min_value=5, max_value=1000, value=30,
+    if param == 'omega':
+        valores = c1.multiselect("ω verdaderos", [0.0, 0.02, 0.05, 0.10, 0.20], default=[0.0, 0.05, 0.10],
+                                 help="ω = 0 mide el tamaño del test; ω > 0, su potencia. ω = 0,10: tras "
+                                      "cada día de tensión, la correlación cierra el 10% de la distancia a "
+                                      "la estructura de estrés.")
+    elif param == 'lambda':
+        valores = c1.multiselect("λ verdaderos", [0.0, 0.25, 0.5, 0.75, 1.0], default=[0.0, 0.5, 1.0],
+                                 help="λ = 0 mide el tamaño del test; λ > 0, su potencia. Tu estimación: λ̂ = 1.")
+    else:
+        max_g = round(0.999 - d.a - d.b - 0.0005, 4)
+        valores = c1.multiselect("γ verdaderos", [0.0, 0.002, 0.005, 0.008], default=[0.0, 0.005],
+                                 help=f"Con a={d.a} y b={d.b}, debe ser γ < {max_g}.")
+    Ts = c2.multiselect("Largos de ventana T (días)", [252, 1000, 2000, 4000, 4836],
+                        default=[4836],
+                        help="4836 = tu ventana 2008-01-02 a 2026-09-23. Las ventanas largas tardan más.")
+    reps = int(c3.number_input("Réplicas por combinación", min_value=5, max_value=1000, value=100,
                                step=5))
+    lr_obs = float(st.number_input("LR observado en tus datos", 0.0, 50.0, d.lr_obs, 0.001,
+                                   format="%.3f",
+                                   help="Con el parámetro en 0, el resumen informa qué fracción de réplicas "
+                                        "lo supera. Solo tiene sentido si el LR observado se obtuvo con el "
+                                        "mismo canal (2,745 corresponde a λ)."))
     s1, s2 = st.columns(2)
     tension = s1.selectbox("Tensión medida como", ["estado", "sorpresa"],
                            help="estado = retornos |r| con volatilidad GARCH; sorpresa = residuos |z|")
@@ -517,8 +602,8 @@ def streamlit_main():
     with st.expander("Parámetros avanzados (DGP y especificación)"):
         a1, a2, a3, a4 = st.columns(4)
         hist = int(a1.number_input("Historia previa (días)", 300, 2000, d.hist, 1))
-        a_p = float(a2.number_input("a verdadero", 0.0, 0.3, d.a, 0.01, format="%.3f"))
-        b_p = float(a3.number_input("b verdadero", 0.3, 0.99, d.b, 0.01, format="%.3f"))
+        a_p = float(a2.number_input("a verdadero", 0.0, 0.3, d.a, 0.001, format="%.4f"))
+        b_p = float(a3.number_input("b verdadero", 0.3, 0.998, d.b, 0.001, format="%.4f"))
         nu = float(a4.number_input("ν de la t (0 = normal)", 0.0, 30.0, d.nu, 1.0))
         a5, a6, a7, a8 = st.columns(4)
         rho_bar = float(a5.number_input("ρ̄ (Q̄)", 0.0, 0.9, d.rho_bar, 0.05))
@@ -533,13 +618,14 @@ def streamlit_main():
         g_b = float(a12.number_input("β GARCH retornos", 0.0, 0.99, d.garch_beta, 0.01,
                                      format="%.3f"))
 
-    n_tot = len(gammas) * len(Ts) * reps
-    seg = sum(len(gammas) * reps * (0.6 + 0.8 * (T + d.hist) / 1000) for T in Ts)
+    n_tot = len(valores) * len(Ts) * reps
+    seg = sum(len(valores) * reps * (0.6 + 0.8 * (T + hist) / 1000) for T in Ts)
     st.caption(f"Total: {n_tot} réplicas · tiempo estimado ≈ {max(1, round(seg / 60))} min "
                "(orientativo; depende del servidor).")
 
     if st.button("▶️ Ejecutar Monte Carlo", type="primary", disabled=(n_tot == 0)):
-        argv = ['--gammas', *map(str, gammas), '--T', *map(str, Ts), '--reps', str(reps),
+        argv = ['--param', param, '--valores', *map(str, valores), '--lr-obs', str(lr_obs),
+                '--T', *map(str, Ts), '--reps', str(reps),
                 '--hist', str(hist), '--a', str(a_p), '--b', str(b_p), '--nu', str(nu),
                 '--rho-bar', str(rho_bar), '--rho-s', str(rho_s), '--alpha', str(alpha),
                 '--kappa', str(kappa), '--min-obs', str(min_obs), '--seed', str(seed),
